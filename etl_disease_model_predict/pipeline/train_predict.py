@@ -200,11 +200,16 @@ def _fit_final_base_predictions(
 def run_source(
     data_source: str,
     forecast_period: int,
-    start_week: int,
+    start_week: int | None,
     use_gpu: bool = False,
     meta_model: str = "ridge",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    print(f"[RUN] source={data_source}, forecast_period={forecast_period}, start_week={start_week}")
+    start_week_label = "ALL" if start_week is None else start_week
+    print(
+        f"[RUN] source={data_source}, "
+        f"forecast_period={forecast_period}, "
+        f"start_week={start_week_label}"
+    )
 
     feature = build_feature_table(data_source, start_week=start_week, forecast_period=forecast_period)
     exog_cols = get_exog_columns(feature)
@@ -286,7 +291,7 @@ def run_source(
 def run_all(
     data_sources: list[str],
     forecast_period: int,
-    start_week: int,
+    start_week: int | None,
     use_gpu: bool = False,
     meta_model: str = "ridge",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:

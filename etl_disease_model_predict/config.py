@@ -8,12 +8,16 @@ import os
 class Settings:
     """專案設定。
 
-    本專案在疾管署內部環境執行時，資料庫連線統一走 eic_utils.conn，
-    因此不使用 POSTGRES_URL / SQLAlchemy engine。
+    本專案在疾管署內部環境執行時，資料庫連線統一走 eic_utils.conn。
+    
     """
 
     forecast_period: int = int(os.getenv("FORECAST_PERIOD", "8"))
-    train_start_yearweek: int = int(os.getenv("TRAIN_START_YEARWEEK", "201401"))
+    train_start_yearweek: int | None = (
+        int(os.getenv("TRAIN_START_YEARWEEK"))
+        if os.getenv("TRAIN_START_YEARWEEK")
+        else None
+    )
 
     dim_dbname: str = os.getenv("DIM_DBNAME", "DIM_DATA")
     postgres_dbname: str = os.getenv("POSTGRES_DBNAME", "postgres")

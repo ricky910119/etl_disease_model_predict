@@ -12,7 +12,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run disease weekly county model prediction pipeline.")
     parser.add_argument("--sources", nargs="+", default=["nhi_er", "nhi_opd", "rods"], choices=list(settings.source_tables.keys()))
     parser.add_argument("--forecast-period", type=int, default=settings.forecast_period)
-    parser.add_argument("--start-week", type=int, default=settings.train_start_yearweek)
+    parser.add_argument(
+        "--start-week",
+        type=int,
+        default=settings.train_start_yearweek,
+        help="Training start yearweek. Default=None means use all available data.",
+    )
     parser.add_argument("--write-db", action="store_true")
     parser.add_argument("--use-gpu", action="store_true", help="Enable GPU parameters for XGBoost/LightGBM/CatBoost when installed and available.")
     parser.add_argument("--meta-model", choices=["ridge", "elasticnet"], default="ridge")

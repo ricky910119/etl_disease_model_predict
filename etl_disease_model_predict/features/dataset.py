@@ -13,7 +13,12 @@ COUNTY_COL_CANDIDATES = ["county", "city", "county_name", "city_name", "COUNTY",
 DISEASE_COL_CANDIDATES = ["disease", "disease_name", "target_disease", "DISEASE"]
 DROP_COLS = {"id", "created_at", "updated_at", "inserted_at", "modified_at"}
 
-
+WIDE_DISEASE_COUNT_COLUMNS = {
+    "ev_total": "EV",
+    "ili_total": "ILI",
+    "di_total": "DI",
+    "u071_total": "U071",
+}
 def _pick_col(df: pd.DataFrame, candidates: list[str], required: bool = True) -> str | None:
     for c in candidates:
         if c in df.columns:
@@ -35,54 +40,215 @@ def _safe_numeric_yearweek(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def load_source_weekly(data_source: str, start_week: int, end_week: int | None = None) -> pd.DataFrame:
+def load_source_weekly(
+    data_source: str,
+    start_week: int | None = None,
+    end_week: int | None = None,
+) -> pd.DataFrame:
+    """
+    讀取疾病週資料。
+
+    start_week=None 時，不加起始週限制，使用資料表內所有歷史資料。
+    """
     if data_source not in settings.source_tables:
-        raise ValueError(f"Unknown data_source={data_source}. Allowed: {list(settings.source_tables)}")
+        raise ValueError(
+            f"Unknown data_source={data_source}. "
+            f"Allowed: {list(settings.source_tables)}"
+        )
 
     table = settings.source_tables[data_source]
-    where = "WHERE yearweek >= :start_week"
-    params = {"start_week": int(start_week)}
+
+    where_parts = []
+    params = {}
+
+    if start_week is not None:
+        where_parts.append("yearweek >= :start_week")
+        params["start_week"] = int(start_week)
+
     if end_week is not None:
-        where += " AND yearweek <= :end_week"
+        where_parts.append("yearweek <= :end_week")
         params["end_week"] = int(end_week)
 
-    df = read_sql(f"SELECT * FROM {table} {where}", params, dbname="postgres")
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    df = read_sql(
+        f"SELECT * FROM {table} {where}",
+        params if params else None,
+        dbname="postgres",
+    )
+
     if df.empty:
-        raise RuntimeError(f"No source data found: source={data_source}, table={table}, start_week={start_week}, end_week={end_week}")
+        raise RuntimeError(
+            f"No source data found: "
+            f"source={data_source}, table={table}, "
+            f"start_week={start_week}, end_week={end_week}"
+        )
+
     df = _safe_numeric_yearweek(df)
     df["data_source"] = data_source
+
+    print(
+        f"[DATA] source={data_source}, "
+        f"rows={len(df)}, "
+        f"min_yearweek={df['yearweek'].min()}, "
+        f"max_yearweek={df['yearweek'].max()}"
+    )
+
     return df
 
 
-def load_weather_weekly(start_week: int, end_week: int | None = None) -> pd.DataFrame:
-    where = "WHERE yearweek >= :start_week"
-    params = {"start_week": int(start_week)}
+def load_weather_weekly(
+    start_week: int | None = None,
+    end_week: int | None = None,
+) -> pd.DataFrame:
+    """
+    讀取週天氣資料。
+
+    start_week=None 時，不加起始週限制。
+    """
+    where_parts = []
+    params = {}
+
+    if start_week is not None:
+        where_parts.append("yearweek >= :start_week")
+        params["start_week"] = int(start_week)
+
     if end_week is not None:
-        where += " AND yearweek <= :end_week"
+        where_parts.append("yearweek <= :end_week")
         params["end_week"] = int(end_week)
-    df = read_sql(f"SELECT * FROM {settings.weather_table} {where}", params, dbname="postgres")
+
+    where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
+    df = read_sql(
+        f"SELECT * FROM {settings.weather_table} {where}",
+        params if params else None,
+        dbname="postgres",
+    )
+
     if df.empty:
-        print(f"[WARN] weather table returned empty rows from {start_week} to {end_week}")
+        print(
+            f"[WARN] weather table returned empty rows "
+            f"from {start_week} to {end_week}"
+        )
         return pd.DataFrame(columns=["yearweek", "county"])
-    return _safe_numeric_yearweek(df)
+
+    df = _safe_numeric_yearweek(df)
+
+    print(
+        f"[DATA] weather rows={len(df)}, "
+        f"min_yearweek={df['yearweek'].min()}, "
+        f"max_yearweek={df['yearweek'].max()}"
+    )
+
+    return df
+
+
+def _find_wide_disease_columns(df: pd.DataFrame) -> dict[str, str]:
+    """
+    找出寬表中的疾病 count 欄位。
+
+    目前 model_rods_weekly_county 是寬表，例如：
+        ev_total
+        ili_total
+        di_total
+
+    會轉成 long format：
+        disease = EV / ILI / DI
+        count = 對應欄位值
+    """
+    found: dict[str, str] = {}
+
+    lower_to_original = {c.lower(): c for c in df.columns}
+
+    for lower_col, disease in WIDE_DISEASE_COUNT_COLUMNS.items():
+        if lower_col in lower_to_original:
+            found[lower_to_original[lower_col]] = disease
+
+    return found
 
 
 def _normalize_target(target: pd.DataFrame) -> pd.DataFrame:
+    """
+    將來源 model_*_weekly_county 統一成：
+
+        yearweek
+        county
+        disease
+        data_source
+        count
+
+    支援兩種格式：
+
+    1. 長表：
+        yearweek, county, disease, count
+
+    2. 寬表：
+        yearweek, county, ev_total, ili_total, di_total
+    """
     target_county = _pick_col(target, COUNTY_COL_CANDIDATES)
-    count_col = _pick_col(target, COUNT_COL_CANDIDATES)
     disease_col = _pick_col(target, DISEASE_COL_CANDIDATES, required=False)
 
-    target = target.rename(columns={target_county: "county", count_col: "count"}).copy()
-    if disease_col:
-        target = target.rename(columns={disease_col: "disease"})
-    else:
-        target["disease"] = "ALL"
+    # -------------------------------------------------
+    # Case 1：長表格式，有 count / weekly_count / cnt
+    # -------------------------------------------------
+    count_col = _pick_col(target, COUNT_COL_CANDIDATES, required=False)
 
-    target["county"] = target["county"].astype(str)
-    target["disease"] = target["disease"].astype(str)
-    target["count"] = pd.to_numeric(target["count"], errors="coerce")
-    return target
+    if count_col is not None:
+        out = target.rename(
+            columns={
+                target_county: "county",
+                count_col: "count",
+            }
+        ).copy()
 
+        if disease_col:
+            out = out.rename(columns={disease_col: "disease"})
+        else:
+            out["disease"] = "ALL"
+
+        out["county"] = out["county"].astype(str)
+        out["disease"] = out["disease"].astype(str)
+        out["count"] = pd.to_numeric(out["count"], errors="coerce")
+
+        return out
+
+    # -------------------------------------------------
+    # Case 2：寬表格式，例如 RODS
+    # -------------------------------------------------
+    wide_cols = _find_wide_disease_columns(target)
+
+    if not wide_cols:
+        raise KeyError(
+            "Cannot find target count column. "
+            f"Expected one of long-table columns={COUNT_COL_CANDIDATES} "
+            f"or wide disease columns={list(WIDE_DISEASE_COUNT_COLUMNS)}. "
+            f"Existing columns: {list(target.columns)}"
+        )
+
+    keep_base_cols = ["yearweek", target_county]
+    if "data_source" in target.columns:
+        keep_base_cols.append("data_source")
+
+    long_parts = []
+
+    for count_column, disease_name in wide_cols.items():
+        tmp = target[keep_base_cols + [count_column]].copy()
+        tmp = tmp.rename(
+            columns={
+                target_county: "county",
+                count_column: "count",
+            }
+        )
+        tmp["disease"] = disease_name
+        long_parts.append(tmp)
+
+    out = pd.concat(long_parts, ignore_index=True)
+
+    out["county"] = out["county"].astype(str)
+    out["disease"] = out["disease"].astype(str)
+    out["count"] = pd.to_numeric(out["count"], errors="coerce")
+
+    return out
 
 def _normalize_weather(weather: pd.DataFrame) -> pd.DataFrame:
     if weather.empty:
@@ -100,7 +266,7 @@ def _normalize_weather(weather: pd.DataFrame) -> pd.DataFrame:
 
 def build_feature_table(
     data_source: str,
-    start_week: int,
+    start_week: int | None,
     forecast_period: int,
     end_week: int | None = None,
 ) -> pd.DataFrame:

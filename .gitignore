@@ -6,3 +6,4 @@ venv/
 .env
 outputs/*.csv
 .DS_Store
+catboost_info/

@@ -36,7 +36,34 @@ from etl_disease_model_predict.utils.week import (
 
 KEY_COLS = ["data_source", "disease", "county"]
 CATEGORICAL_COLS = ["county", "disease", "data_source"]
+OFFSHORE_COUNTIES = {
+    "金門縣",
+    "連江縣",
+    "澎湖縣",
+}
 
+
+WEATHER_COLUMN_KEYWORDS = (
+    "weather",
+    "temp",
+    "temperature",
+    "airtemperature",
+    "humidity",
+    "humd",
+    "rain",
+    "precip",
+    "pressure",
+    "pres",
+    "wind",
+    "wdsd",
+    "wd15",
+    "ws15",
+    "sun",
+    "sunshine",
+    "uv",
+    "cloud",
+    "dew",
+)
 
 @dataclass(frozen=True)
 class RunModeConfig:
@@ -250,6 +277,187 @@ def _feature_columns(
 
     return feature_cols, numeric_cols, categorical_cols
 
+def _is_weather_column(col: str) -> bool:
+    col_lower = str(col).lower()
+
+    return any(keyword in col_lower for keyword in WEATHER_COLUMN_KEYWORDS)
+
+
+def _drop_weather_columns(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    weather_cols = [
+        c for c in df.columns
+        if _is_weather_column(c)
+    ]
+
+    if not weather_cols:
+        return df.copy(), []
+
+    out = df.drop(columns=weather_cols, errors="ignore").copy()
+
+    return out, weather_cols
+
+def _sum_with_nan_if_all_missing(s: pd.Series):
+    return s.sum(min_count=1)
+
+def _collapse_panel_rows(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    將模型前調整後可能重複的 panel rows 合併。
+
+    例如：
+        金門縣、連江縣、澎湖縣 -> 離島
+        RODS EV 各縣市 -> 全國
+
+    合併邏輯：
+        count              加總
+        source_total_count 加總
+        disease_rate       重新計算
+        其他 numeric        平均
+        其他欄位            取第一筆
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    required_cols = {
+        "data_source",
+        "disease",
+        "county",
+        "yearweek",
+        "is_future",
+    }
+
+    missing_cols = required_cols - set(out.columns)
+
+    if missing_cols:
+        raise ValueError(
+            f"_collapse_panel_rows missing columns: {sorted(missing_cols)}"
+        )
+
+    group_cols = [
+        "data_source",
+        "disease",
+        "county",
+        "yearweek",
+        "is_future",
+    ]
+
+    agg_map = {}
+
+    for col in out.columns:
+        if col in group_cols:
+            continue
+
+        if col in {"count", "source_total_count"}:
+            agg_map[col] = _sum_with_nan_if_all_missing
+        elif pd.api.types.is_numeric_dtype(out[col]):
+            agg_map[col] = "mean"
+        else:
+            agg_map[col] = "first"
+
+    collapsed = (
+        out
+        .groupby(group_cols, as_index=False, dropna=False)
+        .agg(agg_map)
+    )
+
+    if {"count", "source_total_count"}.issubset(collapsed.columns):
+        collapsed["disease_rate"] = np.where(
+            collapsed["count"].notna()
+            & collapsed["source_total_count"].notna()
+            & (collapsed["source_total_count"] > 0),
+            collapsed["count"] / collapsed["source_total_count"],
+            np.nan,
+        )
+
+    collapsed = (
+        collapsed
+        .sort_values(["data_source", "disease", "county", "yearweek", "is_future"])
+        .reset_index(drop=True)
+    )
+
+    return collapsed
+
+
+def _merge_offshore_counties(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    模型前將非本島縣市整併成「離島」。
+
+    不改資料庫資料，只改本次進模型的 feature table。
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    if "county" not in out.columns:
+        return out
+
+    out["county"] = out["county"].astype(str).str.strip()
+    out.loc[out["county"].isin(OFFSHORE_COUNTIES), "county"] = "離島"
+
+    out = _collapse_panel_rows(out)
+
+    return out
+
+
+def _prepare_feature_for_model_task(
+    feature: pd.DataFrame,
+    data_source: str,
+    model_task: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    依照 modeling task 做模型前資料調整。
+
+    model_task:
+        default
+            NHI_ER / NHI_OPD 使用，僅做離島整併。
+
+        rods_ev_national
+            RODS EV 獨立建模。
+            EV 全縣市加總為 county='全國'。
+            移除 weather features。
+
+        rods_non_ev
+            RODS 非 EV。
+            縣市照舊，但非本島整併成「離島」。
+    """
+    if feature.empty:
+        return feature.copy(), []
+
+    out = feature.copy()
+    removed_weather_cols: list[str] = []
+
+    if data_source in {"nhi_er", "nhi_opd"}:
+        out = _merge_offshore_counties(out)
+        return out, removed_weather_cols
+
+    if data_source == "rods" and model_task == "rods_ev_national":
+        out = out[out["disease"].astype(str) == "EV"].copy()
+
+        if out.empty:
+            raise RuntimeError("RODS EV feature table is empty after filtering disease=EV")
+
+        out["county"] = "全國"
+        out = _collapse_panel_rows(out)
+
+        out, removed_weather_cols = _drop_weather_columns(out)
+
+        return out, removed_weather_cols
+
+    if data_source == "rods" and model_task == "rods_non_ev":
+        out = out[out["disease"].astype(str) != "EV"].copy()
+
+        if out.empty:
+            raise RuntimeError("RODS non-EV feature table is empty after filtering disease!=EV")
+
+        out = _merge_offshore_counties(out)
+
+        return out, removed_weather_cols
+
+    out = _merge_offshore_counties(out)
+
+    return out, removed_weather_cols
 
 def _apply_recent_weeks(
     df: pd.DataFrame,
@@ -838,6 +1046,66 @@ def _fit_model_with_optional_grid_search(
                 y=y,
                 model_name=model_name,
             )
+
+        raise
+
+    print(
+        f"[GRID] model={model_name}, "
+        f"candidates={np.prod([len(v) for v in param_grid.values()])}, "
+        f"cv_splits={len(cv)}",
+        flush=True,
+    )
+
+    try:
+        search = GridSearchCV(
+            estimator=model,
+            param_grid=param_grid,
+            scoring=WAPE_SCORER,
+            cv=cv,
+            n_jobs=1,
+            refit=True,
+            verbose=0,
+            error_score=np.nan,
+        )
+
+        search.fit(x, y)
+
+        print(
+            f"[GRID] model={model_name}, "
+            f"best_score={search.best_score_}, "
+            f"best_params={json.dumps(search.best_params_, ensure_ascii=False)}",
+            flush=True,
+        )
+
+        return search.best_estimator_
+
+    except ValueError as exc:
+        print(
+            f"[WARN] GridSearch failed for model={model_name}; "
+            f"fallback to plain fit. error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        try:
+            model.fit(x, y)
+            return model
+
+        except Exception as fit_exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+            raise
+
+    except Exception as exc:
+        if _is_constant_target(y) or "All train targets are equal" in str(exc):
+            return _fit_constant_target_model(
+                x=x,
+                y=y,
+                model_name=model_name,
+            )
         raise
 
     param_grid = _param_grid_for_model(model_name)
@@ -1357,6 +1625,7 @@ def run_source(
     use_gpu: bool = False,
     enable_sarimax: bool = False,
     meta_model: str = "ridge",
+    model_task: str = "default",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     cfg = _resolve_config(
         run_mode=run_mode,
@@ -1380,7 +1649,8 @@ def run_source(
         f"covid_policy={covid_policy}, "
         f"enable_grid_search={enable_grid_search}, "
         f"models={cfg.model_names}, "
-        f"enable_sarimax={enable_sarimax}"
+        f"enable_sarimax={enable_sarimax}",
+        f"model_task={model_task}"
     )
 
     feature = build_feature_table(
@@ -1388,10 +1658,36 @@ def run_source(
         start_week=start_week,
         forecast_period=forecast_period,
     )
+
+    feature, removed_weather_cols = _prepare_feature_for_model_task(
+        feature=feature,
+        data_source=data_source,
+        model_task=model_task,
+    )
+
+    if removed_weather_cols:
+        print(
+            f"[MODEL_ADJUST] source={data_source}, "
+            f"model_task={model_task}, "
+            f"removed_weather_cols={len(removed_weather_cols)}",
+            flush=True,
+        )
+
+    print(
+        f"[MODEL_ADJUST] source={data_source}, "
+        f"model_task={model_task}, "
+        f"rows={len(feature)}, "
+        f"diseases={sorted(feature['disease'].dropna().astype(str).unique().tolist())}, "
+        f"county_count={feature['county'].nunique(dropna=True)}, "
+        f"counties={sorted(feature['county'].dropna().astype(str).unique().tolist())[:30]}",
+        flush=True,
+    )
+
     feature = _apply_covid_policy(
         df=feature,
         covid_policy=covid_policy,
     )
+
     exog_cols = get_exog_columns(feature)
     forecast_weeks = forecast_yearweeks(forecast_period)
     train_cut_week = latest_closed_yearweek()
@@ -1545,6 +1841,21 @@ def run_source(
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    model_scope = (
+        "national"
+        if model_task == "rods_ev_national"
+        else "county"
+    )
+
+    is_rods_ev_national = model_task == "rods_ev_national"
+
+    is_offshore_collapsed = model_task in {
+        "default",
+        "rods_non_ev",
+    }
+
+    weather_removed = len(removed_weather_cols) > 0
+
     metric_df = _build_eval_metric_df(
         train=train,
         oof=oof,
@@ -1560,6 +1871,12 @@ def run_source(
         meta_model=meta_model,
         now=now,
     )
+    metric_df["model_task"] = model_task
+    metric_df["model_scope"] = model_scope
+    metric_df["is_rods_ev_national"] = is_rods_ev_national
+    metric_df["is_offshore_collapsed"] = is_offshore_collapsed
+    metric_df["weather_removed"] = weather_removed
+
     future_base = _fit_final_base_predictions(
         train=train,
         future=future,
@@ -1579,16 +1896,41 @@ def run_source(
 
     final_pred = predict_meta(meta, future_base)
 
+    model_scope = (
+        "national"
+        if model_task == "rods_ev_national"
+        else "county"
+    )
+
+    is_rods_ev_national = model_task == "rods_ev_national"
+
+    is_offshore_collapsed = model_task in {
+        "default",
+        "rods_non_ev",
+    }
+
+    weather_removed = len(removed_weather_cols) > 0
 
     id_cols = KEY_COLS + ["yearweek"]
 
     forecast_df = future[id_cols].copy()
     forecast_df["forecast_count"] = final_pred
+    forecast_df["forecast_count_rounded"] = (
+        np.clip(np.rint(forecast_df["forecast_count"].fillna(0)), 0, None)
+        .astype(int)
+    )
     forecast_df["model_name"] = f"stacking_{meta_model}"
+    forecast_df["model_task"] = model_task
+    forecast_df["model_scope"] = model_scope
+    forecast_df["is_rods_ev_national"] = is_rods_ev_national
+    forecast_df["is_offshore_collapsed"] = is_offshore_collapsed
+    forecast_df["weather_removed"] = weather_removed
     forecast_df["run_mode"] = run_mode
     forecast_df["feature_set"] = cfg.feature_set
     forecast_df["feature_select"] = cfg.feature_select
     forecast_df["top_k"] = cfg.top_k
+    forecast_df["covid_policy"] = covid_policy
+    forecast_df["enable_grid_search"] = enable_grid_search
     forecast_df["created_at"] = now
 
     base_rows = []
@@ -1596,6 +1938,11 @@ def run_source(
     for model_name in future_base.columns:
         tmp = future[id_cols].copy()
         tmp["base_model"] = model_name
+        tmp["model_task"] = model_task
+        tmp["model_scope"] = model_scope
+        tmp["is_rods_ev_national"] = is_rods_ev_national
+        tmp["is_offshore_collapsed"] = is_offshore_collapsed
+        tmp["weather_removed"] = weather_removed
         tmp["forecast_count"] = (
             np.clip(np.rint(future_base[model_name].fillna(0)), 0, None)
             .astype(int)
@@ -1617,6 +1964,11 @@ def run_source(
         selected_report["feature_type"] = "numeric"
 
     selected_report["data_source"] = data_source
+    selected_report["model_task"] = model_task
+    selected_report["model_scope"] = model_scope
+    selected_report["is_rods_ev_national"] = is_rods_ev_national
+    selected_report["is_offshore_collapsed"] = is_offshore_collapsed
+    selected_report["weather_removed"] = weather_removed
     selected_report["run_mode"] = run_mode
     selected_report["feature_set"] = cfg.feature_set
     selected_report["feature_select"] = cfg.feature_select
@@ -1650,6 +2002,11 @@ def run_source(
                 "covid_policy": covid_policy,
                 "enable_grid_search": enable_grid_search,
                 "created_at": now,
+                "model_task": model_task,
+                "model_scope": model_scope,
+                "is_rods_ev_national": is_rods_ev_national,
+                "is_offshore_collapsed": is_offshore_collapsed,
+                "weather_removed": weather_removed,
             }
             for col in categorical_cols
         ]
@@ -1662,6 +2019,39 @@ def run_source(
 
     return forecast_df, base_df, metric_df, selected_report
 
+def _expand_model_tasks(data_sources: list[str]) -> list[dict]:
+    """
+    將使用者指定的 data_sources 展開成實際 modeling tasks。
+
+    rods 會拆成兩個任務：
+        1. rods_ev_national
+        2. rods_non_ev
+    """
+    tasks = []
+
+    for source in data_sources:
+        if source == "rods":
+            tasks.append(
+                {
+                    "data_source": "rods",
+                    "model_task": "rods_ev_national",
+                }
+            )
+            tasks.append(
+                {
+                    "data_source": "rods",
+                    "model_task": "rods_non_ev",
+                }
+            )
+        else:
+            tasks.append(
+                {
+                    "data_source": source,
+                    "model_task": "default",
+                }
+            )
+
+    return tasks
 
 def run_all(
     data_sources: list[str],
@@ -1684,7 +2074,12 @@ def run_all(
     metrics = []
     selected_reports = []
 
-    for source in data_sources:
+    tasks = _expand_model_tasks(data_sources)
+
+    for task in tasks:
+        source = task["data_source"]
+        model_task = task["model_task"]
+
         f, b, m, s = run_source(
             data_source=source,
             forecast_period=forecast_period,
@@ -1700,7 +2095,13 @@ def run_all(
             covid_policy=covid_policy,
             enable_grid_search=enable_grid_search,
             grid_cv_splits=grid_cv_splits,
+            model_task=model_task,
         )
+
+        f["model_task"] = model_task
+        b["model_task"] = model_task
+        m["model_task"] = model_task
+        s["model_task"] = model_task
 
         forecasts.append(f)
         bases.append(b)

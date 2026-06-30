@@ -134,33 +134,41 @@ def _make_leaderboard(metric_df: pd.DataFrame) -> pd.DataFrame:
     sort_cols = []
     ascending = []
 
-    if "data_source" in leaderboard.columns:
-        sort_cols.append("data_source")
-        ascending.append(True)
-
-    if "WAPE" in leaderboard.columns:
-        sort_cols.append("WAPE")
-        ascending.append(True)
+    for col in ["data_source", "model_task", "model_layer", "WAPE"]:
+        if col in leaderboard.columns:
+            sort_cols.append(col)
+            ascending.append(True)
 
     if sort_cols:
         leaderboard = leaderboard.sort_values(sort_cols, ascending=ascending)
 
-    if "data_source" in leaderboard.columns and "WAPE" in leaderboard.columns:
-        leaderboard["rank_wape"] = (
-            leaderboard
-            .groupby("data_source")["WAPE"]
-            .rank(method="dense", ascending=True)
-            .astype(int)
-        )
-    elif "WAPE" in leaderboard.columns:
-        leaderboard["rank_wape"] = (
-            leaderboard["WAPE"]
-            .rank(method="dense", ascending=True)
-            .astype(int)
-        )
+    rank_group_cols = [
+        c for c in ["data_source", "model_task"]
+        if c in leaderboard.columns
+    ]
+
+    if "WAPE" in leaderboard.columns:
+        if rank_group_cols:
+            leaderboard["rank_wape"] = (
+                leaderboard
+                .groupby(rank_group_cols)["WAPE"]
+                .rank(method="dense", ascending=True)
+                .astype(int)
+            )
+        else:
+            leaderboard["rank_wape"] = (
+                leaderboard["WAPE"]
+                .rank(method="dense", ascending=True)
+                .astype(int)
+            )
 
     keep_cols = [
         "data_source",
+        "model_task",
+        "model_scope",
+        "is_rods_ev_national",
+        "is_offshore_collapsed",
+        "weather_removed",
         "run_mode",
         "feature_set",
         "feature_select",
@@ -208,6 +216,11 @@ def _make_breakdown(metric_df: pd.DataFrame, top_n: int = 200) -> pd.DataFrame:
 
     keep_cols = [
         "data_source",
+        "model_task",
+        "model_scope",
+        "is_rods_ev_national",
+        "is_offshore_collapsed",
+        "weather_removed",
         "run_mode",
         "feature_set",
         "feature_select",
@@ -253,6 +266,9 @@ def _make_used_features(selected_df: pd.DataFrame) -> pd.DataFrame:
     if "data_source" not in out.columns:
         out["data_source"] = "unknown"
 
+    if "model_task" not in out.columns:
+        out["model_task"] = "unknown"
+
     if "selected" in out.columns:
         selected_mask = (
             out["selected"]
@@ -266,23 +282,52 @@ def _make_used_features(selected_df: pd.DataFrame) -> pd.DataFrame:
     if out.empty:
         return pd.DataFrame()
 
+    sort_cols = [
+        c for c in [
+            "data_source",
+            "model_task",
+            "feature_type",
+            "importance",
+            "feature",
+        ]
+        if c in out.columns
+    ]
+
     if "importance" in out.columns:
         out["importance"] = pd.to_numeric(out["importance"], errors="coerce")
         out = out.sort_values(
-            ["data_source", "feature_type", "importance", "feature"],
-            ascending=[True, True, False, True],
+            sort_cols,
+            ascending=[
+                True if c != "importance" else False
+                for c in sort_cols
+            ],
         )
     else:
-        out = out.sort_values(["data_source", "feature"])
+        out = out.sort_values(
+            [c for c in ["data_source", "model_task", "feature"] if c in out.columns]
+        )
 
-    out["feature_rank"] = (
-        out.groupby("data_source")
-        .cumcount()
-        .add(1)
-    )
+    rank_group_cols = [
+        c for c in ["data_source", "model_task"]
+        if c in out.columns
+    ]
+
+    if rank_group_cols:
+        out["feature_rank"] = (
+            out.groupby(rank_group_cols)
+            .cumcount()
+            .add(1)
+        )
+    else:
+        out["feature_rank"] = out.reset_index().index + 1
 
     keep_cols = [
         "data_source",
+        "model_task",
+        "model_scope",
+        "is_rods_ev_national",
+        "is_offshore_collapsed",
+        "weather_removed",
         "run_mode",
         "feature_set",
         "feature_select",
@@ -306,6 +351,91 @@ def _make_used_features(selected_df: pd.DataFrame) -> pd.DataFrame:
 
     return out[keep_cols]
 
+def _make_forecast_results(forecast_df: pd.DataFrame) -> pd.DataFrame:
+    if forecast_df.empty:
+        return pd.DataFrame()
+
+    out = forecast_df.copy()
+
+    keep_cols = [
+        "data_source",
+        "model_task",
+        "model_scope",
+        "is_rods_ev_national",
+        "is_offshore_collapsed",
+        "weather_removed",
+        "disease",
+        "county",
+        "yearweek",
+        "forecast_count",
+        "model_name",
+        "run_mode",
+        "feature_set",
+        "feature_select",
+        "top_k",
+        "covid_policy",
+        "enable_grid_search",
+        "created_at",
+    ]
+
+    keep_cols = [c for c in keep_cols if c in out.columns]
+
+    sort_cols = [
+        c for c in ["data_source", "model_task", "disease", "county", "yearweek"]
+        if c in out.columns
+    ]
+
+    if sort_cols:
+        out = out.sort_values(sort_cols)
+
+    return out[keep_cols]
+
+
+def _make_base_forecast_results(base_df: pd.DataFrame) -> pd.DataFrame:
+    if base_df.empty:
+        return pd.DataFrame()
+
+    out = base_df.copy()
+
+    keep_cols = [
+        "data_source",
+        "model_task",
+        "model_scope",
+        "is_rods_ev_national",
+        "is_offshore_collapsed",
+        "weather_removed",
+        "disease",
+        "county",
+        "yearweek",
+        "base_model",
+        "forecast_count",
+        "run_mode",
+        "feature_set",
+        "feature_select",
+        "top_k",
+        "covid_policy",
+        "enable_grid_search",
+        "created_at",
+    ]
+
+    keep_cols = [c for c in keep_cols if c in out.columns]
+
+    sort_cols = [
+        c for c in [
+            "data_source",
+            "model_task",
+            "base_model",
+            "disease",
+            "county",
+            "yearweek",
+        ]
+        if c in out.columns
+    ]
+
+    if sort_cols:
+        out = out.sort_values(sort_cols)
+
+    return out[keep_cols]
 
 def _make_run_summary(
     args,
@@ -347,14 +477,25 @@ def _make_run_summary(
 
 
 def _write_outputs(
+    forecast_df: pd.DataFrame,
+    base_df: pd.DataFrame,
     metric_df: pd.DataFrame,
     selected_df: pd.DataFrame,
     args,
     output_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
     leaderboard_df = _make_leaderboard(metric_df)
     breakdown_df = _make_breakdown(metric_df)
     used_features_df = _make_used_features(selected_df)
+    forecast_results_df = _make_forecast_results(forecast_df)
+    base_forecast_results_df = _make_base_forecast_results(base_df)
     summary_df = _make_run_summary(args, metric_df, leaderboard_df)
 
     leaderboard_df.to_csv(
@@ -375,13 +516,32 @@ def _write_outputs(
         encoding="utf-8-sig",
     )
 
+    forecast_results_df.to_csv(
+        output_dir / "forecast_results.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    base_forecast_results_df.to_csv(
+        output_dir / "base_forecast_results.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
     summary_df.to_csv(
         output_dir / "run_summary.csv",
         index=False,
         encoding="utf-8-sig",
     )
 
-    return leaderboard_df, breakdown_df, used_features_df, summary_df
+    return (
+        leaderboard_df,
+        breakdown_df,
+        used_features_df,
+        forecast_results_df,
+        base_forecast_results_df,
+        summary_df,
+    )
 
 
 def _print_console_summary(
@@ -409,6 +569,8 @@ def _print_console_summary(
     else:
         show_cols = [
             "data_source",
+            "model_task",
+            "model_scope",
             "model_layer",
             "model_name",
             "n_obs",
@@ -428,6 +590,7 @@ def _print_console_summary(
     else:
         show_cols = [
             "data_source",
+            "model_task",
             "model_name",
             "metric_level",
             "disease",
@@ -446,6 +609,7 @@ def _print_console_summary(
     else:
         show_cols = [
             "data_source",
+            "model_task",
             "feature_rank",
             "feature",
             "feature_type",
@@ -459,6 +623,8 @@ def _print_console_summary(
     print("  outputs/model_eval_leaderboard.csv")
     print("  outputs/model_eval_breakdown.csv")
     print("  outputs/model_used_features.csv")
+    print("  outputs/forecast_results.csv")
+    print("  outputs/base_forecast_results.csv")
     print("  outputs/run_summary.csv")
     print("============================================\n")
 
@@ -469,7 +635,7 @@ def main():
     output_dir = Path("outputs")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _forecast_df, _base_df, metric_df, selected_df = run_all(
+    forecast_df, base_df, metric_df, selected_df = run_all(
         data_sources=args.sources,
         forecast_period=args.forecast_period,
         start_week=args.start_week,
@@ -486,7 +652,16 @@ def main():
         meta_model=args.meta_model,
     )
 
-    leaderboard_df, breakdown_df, used_features_df, summary_df = _write_outputs(
+    (
+        leaderboard_df,
+        breakdown_df,
+        used_features_df,
+        forecast_results_df,
+        base_forecast_results_df,
+        summary_df,
+    ) = _write_outputs(
+        forecast_df=forecast_df,
+        base_df=base_df,
         metric_df=metric_df,
         selected_df=selected_df,
         args=args,

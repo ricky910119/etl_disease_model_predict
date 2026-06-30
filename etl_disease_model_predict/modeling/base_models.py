@@ -300,7 +300,7 @@ def make_xgboost(
     try:
         from xgboost import XGBRegressor
 
-        kwargs = {"device": "cuda"} if use_gpu else {}
+        kwargs = {} if use_gpu else {}
 
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
@@ -348,7 +348,7 @@ def make_lightgbm(
                 subsample=0.85,
                 colsample_bytree=0.85,
                 objective="regression",
-                device_type="gpu" if use_gpu else "cpu",
+                device_type="cpu" ,
                 random_state=9101,
                 n_jobs=-1,
                 verbose=-1,
@@ -382,7 +382,7 @@ def make_catboost(
                 depth=5,
                 learning_rate=0.04,
                 loss_function="RMSE",
-                task_type="GPU" if use_gpu else "CPU",
+                task_type="CPU",
                 random_seed=9101,
                 verbose=False,
             ),

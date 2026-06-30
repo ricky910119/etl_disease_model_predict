@@ -163,6 +163,76 @@ def load_weather_weekly(
 
     return df
 
+def load_source_total_weekly(
+    data_source: str,
+    start_week: int | None = None,
+    end_week: int | None = None,
+) -> pd.DataFrame:
+    """
+    讀取各資料源每週縣市總就診人數。
+
+    來源表：
+        disease_forecast_data.model_source_total_weekly_county
+
+    粒度：
+        data_source × yearweek × county
+
+    注意：
+        這裡只讀 total_count，不直接作為同週 feature。
+        後續只使用 lag / rolling features。
+    """
+    where_parts = ["data_source = :data_source"]
+    params = {"data_source": data_source}
+
+    if start_week is not None:
+        where_parts.append("yearweek >= :start_week")
+        params["start_week"] = int(start_week)
+
+    if end_week is not None:
+        where_parts.append("yearweek <= :end_week")
+        params["end_week"] = int(end_week)
+
+    where = "WHERE " + " AND ".join(where_parts)
+
+    sql = f"""
+        SELECT
+            data_source,
+            yearweek,
+            county,
+            total_count AS source_total_count
+        FROM {settings.source_total_table}
+        {where}
+    """
+
+    df = read_sql(sql, params, dbname="postgres")
+
+    if df.empty:
+        print(
+            f"[WARN] source total table returned empty rows: "
+            f"source={data_source}, start_week={start_week}, end_week={end_week}"
+        )
+        return pd.DataFrame(
+            columns=[
+                "data_source",
+                "yearweek",
+                "county",
+                "source_total_count",
+            ]
+        )
+
+    df = _safe_numeric_yearweek(df)
+    df["data_source"] = df["data_source"].astype(str)
+    df["county"] = df["county"].astype(str)
+    df["source_total_count"] = pd.to_numeric(
+        df["source_total_count"],
+        errors="coerce",
+    )
+
+    df = df.drop_duplicates(
+        subset=["data_source", "yearweek", "county"]
+    )
+
+    return df
 
 def _find_wide_disease_columns(df: pd.DataFrame) -> dict[str, str]:
     found: dict[str, str] = {}
@@ -283,26 +353,34 @@ def build_feature_table(
     future_weeks = forecast_yearweeks(forecast_period)
     max_needed_week = max(future_weeks + ([end_week] if end_week else []))
 
-    target = _normalize_target(
-        load_source_weekly(
-            data_source=data_source,
-            start_week=start_week,
-            end_week=end_week,
-        )
+    target = _normalize_target(load_source_weekly(data_source, start_week, end_week))
+    weather = _normalize_weather(load_weather_weekly(start_week, max_needed_week))
+    source_total = load_source_total_weekly(
+        data_source=data_source,
+        start_week=start_week,
+        end_week=max_needed_week,
     )
-
-    weather = _normalize_weather(
-        load_weather_weekly(
-            start_week=start_week,
-            end_week=max_needed_week,
-        )
-    )
-
     dim = load_dim_features()
 
-    historical = target[
-        ["yearweek", "county", "disease", "data_source", "count"]
-    ].copy()
+    historical = target[["yearweek", "county", "disease", "data_source", "count"]].copy()
+
+    historical = historical.merge(
+        source_total,
+        on=["data_source", "yearweek", "county"],
+        how="left",
+    )
+
+    historical["source_total_count"] = pd.to_numeric(
+        historical["source_total_count"],
+        errors="coerce",
+    )
+
+    historical["disease_rate"] = np.where(
+        historical["source_total_count"].fillna(0) > 0,
+        historical["count"] / historical["source_total_count"],
+        np.nan,
+    )
+
     historical["is_future"] = False
 
     combos = (
@@ -311,14 +389,33 @@ def build_feature_table(
         .reset_index(drop=True)
     )
 
-    future = combos.merge(
-        pd.DataFrame({"yearweek": future_weeks}),
-        how="cross",
+    future = combos.merge(pd.DataFrame({"yearweek": future_weeks}), how="cross")
+
+    future = future.merge(
+        source_total,
+        on=["data_source", "yearweek", "county"],
+        how="left",
     )
+
     future["count"] = np.nan
+    future["source_total_count"] = pd.to_numeric(
+        future["source_total_count"],
+        errors="coerce",
+    )
+    future["disease_rate"] = np.nan
     future["is_future"] = True
+
     future = future[
-        ["yearweek", "county", "disease", "data_source", "count", "is_future"]
+        [
+            "yearweek",
+            "county",
+            "disease",
+            "data_source",
+            "count",
+            "source_total_count",
+            "disease_rate",
+            "is_future",
+        ]
     ]
 
     df = pd.concat([historical, future], ignore_index=True)
@@ -328,8 +425,20 @@ def build_feature_table(
         .merge(dim, on="yearweek", how="left")
         .sort_values(["data_source", "disease", "county", "yearweek", "is_future"])
         .reset_index(drop=True)
+        
+    )
+    missing_total = (
+        df[(df["is_future"] == False)]
+        ["source_total_count"]
+        .isna()
+        .sum()
     )
 
+    if missing_total > 0:
+        print(
+            f"[WARN] source_total_count missing rows: "
+            f"source={data_source}, missing_rows={missing_total}"
+        )
     return df
 
 
@@ -342,6 +451,8 @@ def get_exog_columns(df: pd.DataFrame) -> list[str]:
         "data_source",
         "count",
         "is_future",
+        "source_total_count",
+        "disease_rate",
         "created_at",
         "updated_at",
         "inserted_at",

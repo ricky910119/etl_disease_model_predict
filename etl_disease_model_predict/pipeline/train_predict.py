@@ -9,6 +9,7 @@ import json
 
 from sklearn.metrics import make_scorer
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.dummy import DummyRegressor
 
 from etl_disease_model_predict.features.dataset import (
     build_feature_table,
@@ -156,16 +157,19 @@ def add_lag_rolling_features(
         out["week_sin"] = np.sin(2 * np.pi * out["week"].astype(float) / 52)
         out["week_cos"] = np.cos(2 * np.pi * out["week"].astype(float) / 52)
 
-    grp = out.groupby(KEY_COLS, dropna=False)["count"]
+    # =====================================================
+    # 1. disease count lag / rolling
+    # =====================================================
+    count_grp = out.groupby(KEY_COLS, dropna=False)["count"]
 
     for lag in cfg["lags"]:
-        out[f"lag_{lag}"] = grp.shift(lag)
+        out[f"lag_{lag}"] = count_grp.shift(lag)
 
     for window in cfg["rolling_windows"]:
-        out[f"roll{window}_mean"] = grp.transform(
+        out[f"roll{window}_mean"] = count_grp.transform(
             lambda s: s.shift(1).rolling(window, min_periods=1).mean()
         )
-        out[f"roll{window}_std"] = grp.transform(
+        out[f"roll{window}_std"] = count_grp.transform(
             lambda s: s.shift(1).rolling(window, min_periods=2).std()
         )
 
@@ -180,6 +184,43 @@ def add_lag_rolling_features(
             denom = out[lag_col].replace(0, np.nan)
             out[f"growth_{lag}"] = (out["count"] - out[lag_col]) / denom
 
+    # =====================================================
+    # 2. source total count lag / rolling
+    #    不直接使用同週 source_total_count，避免 future 不穩定
+    # =====================================================
+    if "source_total_count" in out.columns:
+        total_grp = out.groupby(KEY_COLS, dropna=False)["source_total_count"]
+
+        for lag in cfg["lags"]:
+            out[f"source_total_count_lag_{lag}"] = total_grp.shift(lag)
+
+        for window in cfg["rolling_windows"]:
+            out[f"source_total_count_roll{window}_mean"] = total_grp.transform(
+                lambda s: s.shift(1).rolling(window, min_periods=1).mean()
+            )
+            out[f"source_total_count_roll{window}_std"] = total_grp.transform(
+                lambda s: s.shift(1).rolling(window, min_periods=2).std()
+            )
+
+    # =====================================================
+    # 3. disease rate lag / rolling
+    #    disease_rate = count / source_total_count
+    #    只使用 lag / rolling，不使用同週 disease_rate
+    # =====================================================
+    if "disease_rate" in out.columns:
+        rate_grp = out.groupby(KEY_COLS, dropna=False)["disease_rate"]
+
+        for lag in cfg["lags"]:
+            out[f"disease_rate_lag_{lag}"] = rate_grp.shift(lag)
+
+        for window in cfg["rolling_windows"]:
+            out[f"disease_rate_roll{window}_mean"] = rate_grp.transform(
+                lambda s: s.shift(1).rolling(window, min_periods=1).mean()
+            )
+            out[f"disease_rate_roll{window}_std"] = rate_grp.transform(
+                lambda s: s.shift(1).rolling(window, min_periods=2).std()
+            )
+
     return out
 
 
@@ -193,6 +234,10 @@ def _feature_columns(
         or c.startswith("roll")
         or c.startswith("diff_")
         or c.startswith("growth_")
+        or c.startswith("source_total_count_lag_")
+        or c.startswith("source_total_count_roll")
+        or c.startswith("disease_rate_lag_")
+        or c.startswith("disease_rate_roll")
         or c in {"week_sin", "week_cos"}
     ]
 
@@ -296,6 +341,19 @@ def _recursive_future_features(
     future = future_exog.sort_values("yearweek").head(forecast_period).copy()
 
     count_history = hist["count"].astype(float).dropna().tolist()
+
+    total_history = (
+        hist["source_total_count"].astype(float).dropna().tolist()
+        if "source_total_count" in hist.columns
+        else []
+    )
+
+    rate_history = (
+        hist["disease_rate"].astype(float).dropna().tolist()
+        if "disease_rate" in hist.columns
+        else []
+    )
+
     rows = []
 
     for _, row in future.iterrows():
@@ -305,6 +363,9 @@ def _recursive_future_features(
             item["week_sin"] = np.sin(2 * np.pi * float(item["week"]) / 52)
             item["week_cos"] = np.cos(2 * np.pi * float(item["week"]) / 52)
 
+        # =====================================================
+        # 1. count lag
+        # =====================================================
         for lag in cfg["lags"]:
             item[f"lag_{lag}"] = (
                 count_history[-lag]
@@ -312,6 +373,9 @@ def _recursive_future_features(
                 else np.nan
             )
 
+        # =====================================================
+        # 2. count rolling
+        # =====================================================
         for window in cfg["rolling_windows"]:
             vals = count_history[-window:]
 
@@ -320,6 +384,7 @@ def _recursive_future_features(
                 if vals
                 else np.nan
             )
+
             item[f"roll{window}_std"] = (
                 float(np.std(vals, ddof=1))
                 if len(vals) > 1
@@ -328,8 +393,12 @@ def _recursive_future_features(
 
         current_proxy = count_history[-1] if count_history else 0.0
 
+        # =====================================================
+        # 3. count diff / growth
+        # =====================================================
         for lag in cfg["diff_lags"]:
             lag_value = item.get(f"lag_{lag}", np.nan)
+
             item[f"diff_{lag}"] = (
                 current_proxy - lag_value
                 if pd.notna(lag_value)
@@ -344,9 +413,69 @@ def _recursive_future_features(
             else:
                 item[f"growth_{lag}"] = np.nan
 
+        # =====================================================
+        # 4. source_total_count lag / rolling
+        # =====================================================
+        if total_history:
+            for lag in cfg["lags"]:
+                item[f"source_total_count_lag_{lag}"] = (
+                    total_history[-lag]
+                    if len(total_history) >= lag
+                    else np.nan
+                )
+
+            for window in cfg["rolling_windows"]:
+                vals = total_history[-window:]
+
+                item[f"source_total_count_roll{window}_mean"] = (
+                    float(np.mean(vals))
+                    if vals
+                    else np.nan
+                )
+
+                item[f"source_total_count_roll{window}_std"] = (
+                    float(np.std(vals, ddof=1))
+                    if len(vals) > 1
+                    else 0.0
+                )
+
+        # =====================================================
+        # 5. disease_rate lag / rolling
+        # =====================================================
+        if rate_history:
+            for lag in cfg["lags"]:
+                item[f"disease_rate_lag_{lag}"] = (
+                    rate_history[-lag]
+                    if len(rate_history) >= lag
+                    else np.nan
+                )
+
+            for window in cfg["rolling_windows"]:
+                vals = rate_history[-window:]
+
+                item[f"disease_rate_roll{window}_mean"] = (
+                    float(np.mean(vals))
+                    if vals
+                    else np.nan
+                )
+
+                item[f"disease_rate_roll{window}_std"] = (
+                    float(np.std(vals, ddof=1))
+                    if len(vals) > 1
+                    else 0.0
+                )
+
         rows.append(item)
 
+        # 未來 recursive：count 先用最近一期 proxy 延續
         count_history.append(current_proxy)
+
+        # total/rate 未來值暫時沿用最近一期，避免第 2 週後 lag 斷掉
+        if total_history:
+            total_history.append(total_history[-1])
+
+        if rate_history:
+            rate_history.append(rate_history[-1])
 
     return pd.DataFrame(rows)
 
@@ -541,6 +670,41 @@ def _filter_valid_param_grid(model, param_grid: dict) -> dict:
         if key in valid_params
     }
 
+def _is_constant_target(y) -> bool:
+    y_series = pd.to_numeric(pd.Series(y), errors="coerce").dropna()
+
+    if y_series.empty:
+        return True
+
+    return y_series.nunique(dropna=True) <= 1
+
+
+def _fit_constant_target_model(x: pd.DataFrame, y, model_name: str):
+    y_series = pd.to_numeric(pd.Series(y), errors="coerce").dropna()
+
+    if y_series.empty:
+        constant_value = 0.0
+    else:
+        constant_value = float(y_series.iloc[0])
+
+    print(
+        f"[WARN] model={model_name} skipped normal training because "
+        f"all train targets are equal. fallback=DummyRegressor, "
+        f"constant={constant_value}",
+        flush=True,
+    )
+
+    fallback = DummyRegressor(
+        strategy="constant",
+        constant=constant_value,
+    )
+
+    fallback.fit(
+        x,
+        np.repeat(constant_value, len(x)),
+    )
+
+    return fallback
 
 def _fit_model_with_optional_grid_search(
     model,
@@ -554,22 +718,49 @@ def _fit_model_with_optional_grid_search(
     """
     Global panel model 的 fit helper。
 
-    enable_grid_search=False 時，直接 fit。
-    enable_grid_search=True 時，對支援的模型跑 GridSearchCV。
+    保護機制：
+    1. y 全部相同時，直接使用 DummyRegressor。
+    2. GridSearch 失敗時，退回原模型 fit。
+    3. CatBoost 遇到 All train targets are equal 時，退回 DummyRegressor。
     """
     x = train_df[feature_cols]
     y = train_df[y_col].astype(float)
 
+    if _is_constant_target(y):
+        return _fit_constant_target_model(
+            x=x,
+            y=y,
+            model_name=model_name,
+        )
+
     if not enable_grid_search:
-        model.fit(x, y)
-        return model
+        try:
+            model.fit(x, y)
+            return model
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+            raise
 
     param_grid = _param_grid_for_model(model_name)
     param_grid = _filter_valid_param_grid(model, param_grid)
 
     if not param_grid:
-        model.fit(x, y)
-        return model
+        try:
+            model.fit(x, y)
+            return model
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+            raise
 
     cv = _yearweek_cv_splits(
         train_df,
@@ -578,35 +769,159 @@ def _fit_model_with_optional_grid_search(
     )
 
     if not cv:
-        model.fit(x, y)
-        return model
+        try:
+            model.fit(x, y)
+            return model
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+            raise
 
     print(
         f"[GRID] model={model_name}, "
         f"candidates={np.prod([len(v) for v in param_grid.values()])}, "
-        f"cv_splits={len(cv)}"
+        f"cv_splits={len(cv)}",
+        flush=True,
     )
 
-    search = GridSearchCV(
-        estimator=model,
-        param_grid=param_grid,
-        scoring=WAPE_SCORER,
-        cv=cv,
-        n_jobs=1,
-        refit=True,
-        verbose=0,
-        error_score=np.nan,
-    )
+    try:
+        search = GridSearchCV(
+            estimator=model,
+            param_grid=param_grid,
+            scoring=WAPE_SCORER,
+            cv=cv,
+            n_jobs=1,
+            refit=True,
+            verbose=0,
+            error_score=np.nan,
+        )
 
-    search.fit(x, y)
+        search.fit(x, y)
 
-    print(
-        f"[GRID] model={model_name}, "
-        f"best_score={search.best_score_}, "
-        f"best_params={json.dumps(search.best_params_, ensure_ascii=False)}"
-    )
+        print(
+            f"[GRID] model={model_name}, "
+            f"best_score={search.best_score_}, "
+            f"best_params={json.dumps(search.best_params_, ensure_ascii=False)}",
+            flush=True,
+        )
 
-    return search.best_estimator_
+        return search.best_estimator_
+
+    except ValueError as exc:
+        print(
+            f"[WARN] GridSearch failed for model={model_name}; "
+            f"fallback to plain fit. error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        try:
+            model.fit(x, y)
+            return model
+
+        except Exception as fit_exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+            raise
+
+    except Exception as exc:
+        if _is_constant_target(y) or "All train targets are equal" in str(exc):
+            return _fit_constant_target_model(
+                x=x,
+                y=y,
+                model_name=model_name,
+            )
+        raise
+
+    param_grid = _param_grid_for_model(model_name)
+
+    if not param_grid:
+        try:
+            model.fit(x, y)
+            return model
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+
+            raise
+
+    if cv_splits is None or len(cv_splits) == 0:
+        try:
+            model.fit(x, y)
+            return model
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+
+            raise
+
+    try:
+        search = GridSearchCV(
+            estimator=model,
+            param_grid=param_grid,
+            scoring=WAPE_SCORER,
+            cv=cv_splits,
+            n_jobs=1,
+            refit=True,
+            error_score=np.nan,
+        )
+
+        search.fit(x, y)
+
+        print(
+            f"[GRID] model={model_name}, "
+            f"best_score={search.best_score_}, "
+            f"best_params={search.best_params_}",
+            flush=True,
+        )
+
+        return search.best_estimator_
+
+    except ValueError as exc:
+        print(
+            f"[WARN] GridSearch failed for model={model_name}; "
+            f"fallback to plain fit. error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        try:
+            model.fit(x, y)
+            return model
+
+        except Exception as fit_exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+
+            raise
+
+    except Exception as exc:
+        if _is_constant_target(y) or "All train targets are equal" in str(exc):
+            return _fit_constant_target_model(
+                x=x,
+                y=y,
+                model_name=model_name,
+            )
+
+        raise
 
 def _metric_row(
     y_true,

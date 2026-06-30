@@ -23,6 +23,7 @@ class Settings:
     postgres_dbname: str = os.getenv("POSTGRES_DBNAME", "postgres")
 
     weather_table: str = "disease_forecast_data.weather_weekly_city"
+    source_total_table: str = "disease_forecast_data.model_source_total_weekly_county"
     source_tables: dict[str, str] = field(default_factory=lambda: {
         "nhi_er": "disease_forecast_data.model_nhi_er_weekly_county",
         "nhi_opd": "disease_forecast_data.model_nhi_opd_weekly_county",

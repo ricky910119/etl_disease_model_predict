@@ -5,7 +5,7 @@ from typing import Callable
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.compose import ColumnTransformer
 from sklearn.dummy import DummyRegressor
 from sklearn.impute import SimpleImputer
@@ -78,6 +78,155 @@ class ConstantSeriesForecaster:
     def predict(self, n_periods: int, X=None):
         return np.repeat(self.value, n_periods)
 
+class KerasMLPRegressor(BaseEstimator, RegressorMixin):
+    """
+    TensorFlow / Keras tabular MLP regressor.
+
+    用於目前的 panel tabular forecasting 架構：
+        categorical one-hot + numeric lag/rolling/weather/calendar features
+
+    sklearn pipeline:
+        ColumnTransformer -> numpy -> KerasMLPRegressor
+    """
+
+    def __init__(
+        self,
+        hidden_dims=(256, 128),
+        dropout: float = 0.10,
+        lr: float = 0.001,
+        batch_size: int = 1024,
+        max_epochs: int = 80,
+        patience: int = 10,
+        validation_fraction: float = 0.15,
+        use_gpu: bool = False,
+        random_state: int = 9101,
+        verbose: int = 0,
+    ):
+        self.hidden_dims = hidden_dims
+        self.dropout = dropout
+        self.lr = lr
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self.patience = patience
+        self.validation_fraction = validation_fraction
+        self.use_gpu = use_gpu
+        self.random_state = random_state
+        self.verbose = verbose
+
+    def _build_model(self, input_dim: int):
+        import tensorflow as tf
+
+        tf.keras.utils.set_random_seed(self.random_state)
+
+        inputs = tf.keras.Input(shape=(input_dim,))
+        x = inputs
+
+        for hidden_dim in self.hidden_dims:
+            x = tf.keras.layers.Dense(int(hidden_dim))(x)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.Activation("relu")(x)
+
+            if self.dropout and self.dropout > 0:
+                x = tf.keras.layers.Dropout(float(self.dropout))(x)
+
+        outputs = tf.keras.layers.Dense(1)(x)
+
+        model = tf.keras.Model(inputs=inputs, outputs=outputs)
+
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(learning_rate=float(self.lr)),
+            loss="mse",
+        )
+
+        return model
+
+    def fit(self, X, y):
+        import tensorflow as tf
+
+        X_arr = np.asarray(X, dtype=np.float32)
+        y_arr = np.asarray(y, dtype=np.float32).reshape(-1, 1)
+
+        if X_arr.ndim != 2:
+            raise ValueError(f"X must be 2D, got shape={X_arr.shape}")
+
+        n_rows = X_arr.shape[0]
+
+        if n_rows < 10:
+            self.fallback_ = float(np.nanmean(y_arr)) if n_rows else 0.0
+            self.model_ = None
+            return self
+
+        self.y_mean_ = float(np.mean(y_arr))
+        self.y_std_ = float(np.std(y_arr))
+
+        if self.y_std_ == 0 or np.isnan(self.y_std_):
+            self.y_std_ = 1.0
+
+        y_scaled = (y_arr - self.y_mean_) / self.y_std_
+
+        valid_size = int(n_rows * float(self.validation_fraction))
+        valid_size = max(1, valid_size)
+        valid_size = min(valid_size, max(1, n_rows - 1))
+
+        train_end = n_rows - valid_size
+
+        X_train = X_arr[:train_end]
+        y_train = y_scaled[:train_end]
+        X_valid = X_arr[train_end:]
+        y_valid = y_scaled[train_end:]
+
+        gpu_devices = tf.config.list_physical_devices("GPU")
+
+        if self.use_gpu and gpu_devices:
+            device_name = "/GPU:0"
+        else:
+            device_name = "/CPU:0"
+
+        if self.use_gpu and not gpu_devices:
+            print("[WARN] use_gpu=True but TensorFlow GPU is unavailable. KerasMLP uses CPU.")
+
+        with tf.device(device_name):
+            self.model_ = self._build_model(input_dim=X_arr.shape[1])
+
+            callbacks = [
+                tf.keras.callbacks.EarlyStopping(
+                    monitor="val_loss",
+                    patience=int(self.patience),
+                    restore_best_weights=True,
+                )
+            ]
+
+            history = self.model_.fit(
+                X_train,
+                y_train,
+                validation_data=(X_valid, y_valid),
+                epochs=int(self.max_epochs),
+                batch_size=int(self.batch_size),
+                shuffle=True,
+                verbose=int(self.verbose),
+                callbacks=callbacks,
+            )
+
+        self.input_dim_ = X_arr.shape[1]
+        self.best_valid_loss_ = float(np.min(history.history.get("val_loss", [np.nan])))
+
+        return self
+
+    def predict(self, X):
+        X_arr = np.asarray(X, dtype=np.float32)
+
+        if getattr(self, "model_", None) is None:
+            return np.repeat(getattr(self, "fallback_", 0.0), X_arr.shape[0])
+
+        pred = self.model_.predict(
+            X_arr,
+            batch_size=int(self.batch_size),
+            verbose=0,
+        ).reshape(-1)
+
+        pred = pred * self.y_std_ + self.y_mean_
+
+        return pred.astype(float)
 
 def _one_hot_encoder():
     try:
@@ -249,6 +398,40 @@ def make_catboost(
             DummyRegressor(strategy="mean"),
         )
 
+def make_keras_mlp(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    use_gpu: bool = False,
+):
+    try:
+        import tensorflow as tf  # noqa: F401
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            _as_numpy_transformer(),
+            KerasMLPRegressor(
+                hidden_dims=(256, 128),
+                dropout=0.10,
+                lr=0.001,
+                batch_size=1024,
+                max_epochs=80,
+                patience=10,
+                validation_fraction=0.15,
+                use_gpu=use_gpu,
+                random_state=9101,
+                verbose=0,
+            ),
+        )
+
+    except Exception as exc:
+        print(
+            f"[WARN] TensorFlow/Keras unavailable, fallback DummyRegressor: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            DummyRegressor(strategy="mean"),
+        )
 
 def fit_sarimax(y: pd.Series, x: pd.DataFrame | None = None):
     y = pd.Series(y).astype(float).dropna()
@@ -350,6 +533,12 @@ def build_base_registry(
             "global_panel",
             lambda: make_catboost(numeric_cols, categorical_cols, use_gpu),
             enabled=("catboost" in allowed),
+        ),
+        ModelSpec(
+            "keras_mlp",
+            "global_panel",
+            lambda: make_keras_mlp(numeric_cols, categorical_cols, use_gpu),
+            enabled=("keras_mlp" in allowed),
         ),
         ModelSpec(
             "sarimax",

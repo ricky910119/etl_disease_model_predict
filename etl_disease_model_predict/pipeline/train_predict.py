@@ -81,6 +81,7 @@ RUN_MODE_CONFIG = {
             "xgboost",
             "lightgbm",
             "catboost",
+            "keras_mlp",
         ],
     ),
     "forecast": RunModeConfig(
@@ -514,6 +515,17 @@ def _param_grid_for_model(model_name: str) -> dict:
             "catboostregressor__iterations": [300, 500],
             "catboostregressor__depth": [4, 6],
             "catboostregressor__learning_rate": [0.03, 0.05],
+        },
+         "keras_mlp": {
+            "kerasmlpregressor__hidden_dims": [
+                (128, 64),
+                (256, 128),
+            ],
+            "kerasmlpregressor__dropout": [0.05, 0.15],
+            "kerasmlpregressor__lr": [0.001, 0.0005],
+            "kerasmlpregressor__batch_size": [1024],
+            "kerasmlpregressor__max_epochs": [60],
+            "kerasmlpregressor__patience": [8],
         },
     }
 

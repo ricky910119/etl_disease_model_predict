@@ -1,36 +1,184 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import ElasticNet, RidgeCV
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+
+from sklearn.base import BaseEstimator
+from sklearn.linear_model import (
+    ElasticNet,
+    HuberRegressor,
+    Lasso,
+    LinearRegression,
+    Ridge,
+)
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 
-def fit_meta_model(base_oof: pd.DataFrame, y_true: pd.Series, method: str = "ridge"):
-    x = base_oof.fillna(0)
-    y = pd.Series(y_true).astype(float)
+@dataclass
+class MetaModel:
+    method: str
+    model: BaseEstimator
+    feature_names: list[str]
+
+
+def _as_frame(x) -> pd.DataFrame:
+    if isinstance(x, pd.DataFrame):
+        return x.copy()
+
+    return pd.DataFrame(x)
+
+
+def _clean_meta_x(x: pd.DataFrame) -> pd.DataFrame:
+    out = _as_frame(x)
+
+    for col in out.columns:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    return out
+
+
+def _clean_meta_y(y) -> pd.Series:
+    out = pd.to_numeric(pd.Series(y), errors="coerce")
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+
+def _make_meta_estimator(method: str) -> BaseEstimator:
+    method = str(method).lower().strip()
+
+    if method == "ridge":
+        return make_pipeline(
+            StandardScaler(),
+            Ridge(alpha=1.0, random_state=9101),
+        )
+
     if method == "elasticnet":
-        model = make_pipeline(StandardScaler(), ElasticNet(alpha=0.02, l1_ratio=0.2, max_iter=5000, random_state=9101))
+        return make_pipeline(
+            StandardScaler(),
+            ElasticNet(
+                alpha=0.01,
+                l1_ratio=0.25,
+                positive=False,
+                max_iter=20000,
+                random_state=9101,
+            ),
+        )
+
+    if method == "lasso":
+        return make_pipeline(
+            StandardScaler(),
+            Lasso(
+                alpha=0.01,
+                positive=False,
+                max_iter=20000,
+                random_state=9101,
+            ),
+        )
+
+    if method == "huber":
+        return make_pipeline(
+            StandardScaler(),
+            HuberRegressor(
+                epsilon=1.35,
+                alpha=0.0001,
+                max_iter=1000,
+            ),
+        )
+
+    if method == "nonnegative_linear":
+        return LinearRegression(
+            positive=True,
+        )
+
+    raise ValueError(
+        f"Unknown meta model method={method}. "
+        f"Allowed: ridge, elasticnet, lasso, huber, nonnegative_linear"
+    )
+
+
+def fit_meta_model(
+    x,
+    y,
+    method: str = "ridge",
+) -> MetaModel:
+    x_df = _clean_meta_x(x)
+    y_sr = _clean_meta_y(y)
+
+    mask = y_sr.notna()
+
+    for col in x_df.columns:
+        mask &= x_df[col].notna()
+
+    x_fit = x_df.loc[mask].copy()
+    y_fit = y_sr.loc[mask].astype(float).copy()
+
+    if x_fit.empty:
+        raise RuntimeError(
+            f"Cannot fit meta model method={method}: empty training data"
+        )
+
+    estimator = _make_meta_estimator(method)
+    estimator.fit(x_fit, y_fit)
+
+    return MetaModel(
+        method=method,
+        model=estimator,
+        feature_names=x_fit.columns.astype(str).tolist(),
+    )
+
+
+def predict_meta(
+    meta: MetaModel,
+    x,
+) -> np.ndarray:
+    x_df = _clean_meta_x(x)
+
+    for col in meta.feature_names:
+        if col not in x_df.columns:
+            x_df[col] = np.nan
+
+    x_df = x_df[meta.feature_names].copy()
+
+    if x_df.isna().any().any():
+        x_df = x_df.fillna(x_df.median(numeric_only=True))
+        x_df = x_df.fillna(0)
+
+    pred = meta.model.predict(x_df)
+
+    pred = np.asarray(pred, dtype=float)
+    pred = np.clip(pred, 0, None)
+
+    return pred
+
+
+def extract_meta_weights(meta: MetaModel) -> pd.DataFrame:
+    model = meta.model
+
+    if hasattr(model, "named_steps"):
+        estimator = list(model.named_steps.values())[-1]
     else:
-        model = make_pipeline(StandardScaler(), RidgeCV(alphas=[0.1, 1.0, 10.0, 50.0, 100.0]))
-    model.fit(x, y)
-    return model
+        estimator = model
 
+    if not hasattr(estimator, "coef_"):
+        return pd.DataFrame(
+            columns=[
+                "meta_model",
+                "base_model",
+                "weight",
+            ]
+        )
 
-def predict_meta(model, base_future: pd.DataFrame) -> np.ndarray:
-    pred = model.predict(base_future.fillna(0))
-    return np.clip(np.rint(pred), 0, None).astype(int)
+    coef = np.asarray(estimator.coef_, dtype=float).ravel()
 
-
-def regression_metrics(y_true, y_pred) -> dict:
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    mae = mean_absolute_error(y_true, y_pred)
-    rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
-    denom = np.sum(np.abs(y_true))
-    wape = np.nan if denom == 0 else np.sum(np.abs(y_true - y_pred)) / denom
-    bias = float(np.mean(y_pred - y_true))
-    smape = float(np.nanmean(2 * np.abs(y_pred - y_true) / np.maximum(np.abs(y_true) + np.abs(y_pred), 1e-9)))
-    return {"mae": mae, "rmse": rmse, "wape": wape, "smape": smape, "bias": bias}
+    return pd.DataFrame(
+        {
+            "meta_model": meta.method,
+            "base_model": meta.feature_names,
+            "weight": coef,
+        }
+    )

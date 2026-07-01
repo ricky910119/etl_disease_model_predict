@@ -397,7 +397,113 @@ def make_catboost(
             make_preprocessor(numeric_cols, categorical_cols),
             DummyRegressor(strategy="mean"),
         )
+def make_xgboost_poisson(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    use_gpu: bool = False,
+):
+    try:
+        from xgboost import XGBRegressor
 
+        kwargs = {}
+        if use_gpu:
+            kwargs["device"] = "cuda"
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            XGBRegressor(
+                n_estimators=500,
+                max_depth=3,
+                learning_rate=0.03,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                objective="count:poisson",
+                tree_method="hist",
+                random_state=9101,
+                n_jobs=-1,
+                **kwargs,
+            ),
+        )
+
+    except Exception as exc:
+        print(
+            f"[WARN] xgboost_poisson unavailable, fallback DummyRegressor: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            DummyRegressor(strategy="mean"),
+        )
+def make_lightgbm_poisson(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    use_gpu: bool = False,
+):
+    try:
+        from lightgbm import LGBMRegressor
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            LGBMRegressor(
+                n_estimators=700,
+                learning_rate=0.03,
+                num_leaves=31,
+                subsample=0.85,
+                colsample_bytree=0.85,
+                objective="poisson",
+                device_type="gpu" if use_gpu else "cpu",
+                random_state=9101,
+                n_jobs=-1,
+                verbose=-1,
+            ),
+        )
+
+    except Exception as exc:
+        print(
+            f"[WARN] lightgbm_poisson unavailable, fallback DummyRegressor: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            DummyRegressor(strategy="mean"),
+        )
+def make_catboost_poisson(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    use_gpu: bool = False,
+):
+    try:
+        from catboost import CatBoostRegressor
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            CatBoostRegressor(
+                iterations=500,
+                depth=4,
+                learning_rate=0.03,
+                loss_function="Poisson",
+                task_type="GPU" if use_gpu else "CPU",
+                random_seed=9101,
+                verbose=False,
+            ),
+        )
+
+    except Exception as exc:
+        print(
+            f"[WARN] catboost_poisson unavailable, fallback DummyRegressor: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+
+        return make_pipeline(
+            make_preprocessor(numeric_cols, categorical_cols),
+            DummyRegressor(strategy="mean"),
+        )
+                
 def make_keras_mlp(
     numeric_cols: list[str],
     categorical_cols: list[str],
@@ -486,69 +592,111 @@ def build_base_registry(
     numeric_cols: list[str],
     categorical_cols: list[str],
     use_gpu: bool = False,
-    model_names: list[str] | None = None,
-    enable_sarimax: bool = False,
+    model_task: str = "default",
 ) -> list[ModelSpec]:
     """
-    Base model registry。
+    建立 base model pool。
 
-    model_names 控制本次要跑哪些模型。
-    SARIMAX 預設關閉，避免測試與排程耗時過長。
+    不改資料粒度，只依 model_task 決定模型池。
+
+    EV task:
+        使用 count-oriented models。
+        不使用 keras_mlp。
+
+    non-EV task:
+        使用原本穩定模型。
+        不使用 keras_mlp。
     """
-    allowed = set(model_names or [])
+    is_ev_task = model_task in {
+        "nhi_ev_branch",
+        "rods_ev_national",
+    }
 
-    specs = [
+    is_rods_ev_national = model_task == "rods_ev_national"
+
+    registry = [
         ModelSpec(
             "seasonal_naive",
             "naive",
             lambda: SeasonalNaiveRegressor(52),
-            enabled=("seasonal_naive" in allowed),
         ),
         ModelSpec(
             "ridge",
             "global_panel",
             lambda: make_ridge(numeric_cols, categorical_cols),
-            enabled=("ridge" in allowed),
         ),
         ModelSpec(
             "elasticnet",
             "global_panel",
             lambda: make_elasticnet(numeric_cols, categorical_cols),
-            enabled=("elasticnet" in allowed),
         ),
         ModelSpec(
             "xgboost",
             "global_panel",
-            lambda: make_xgboost(numeric_cols, categorical_cols, use_gpu),
-            enabled=("xgboost" in allowed),
+            lambda: make_xgboost(numeric_cols, categorical_cols, use_gpu=use_gpu),
         ),
         ModelSpec(
             "lightgbm",
             "global_panel",
-            lambda: make_lightgbm(numeric_cols, categorical_cols, use_gpu),
-            enabled=("lightgbm" in allowed),
+            lambda: make_lightgbm(numeric_cols, categorical_cols, use_gpu=use_gpu),
         ),
         ModelSpec(
             "catboost",
             "global_panel",
-            lambda: make_catboost(numeric_cols, categorical_cols, use_gpu),
-            enabled=("catboost" in allowed),
-        ),
-        ModelSpec(
-            "keras_mlp",
-            "global_panel",
-            lambda: make_keras_mlp(numeric_cols, categorical_cols, use_gpu),
-            enabled=("keras_mlp" in allowed),
-        ),
-        ModelSpec(
-            "sarimax",
-            "local_series",
-            lambda: "sarimax",
-            enabled=("sarimax" in allowed and enable_sarimax),
+            lambda: make_catboost(numeric_cols, categorical_cols, use_gpu=use_gpu),
         ),
     ]
 
-    return specs
+    # EV 才加入 count-based boosting
+    if is_ev_task:
+        registry.extend(
+            [
+                ModelSpec(
+                    "xgboost_poisson",
+                    "global_panel",
+                    lambda: make_xgboost_poisson(
+                        numeric_cols,
+                        categorical_cols,
+                        use_gpu=use_gpu,
+                    ),
+                ),
+                ModelSpec(
+                    "lightgbm_poisson",
+                    "global_panel",
+                    lambda: make_lightgbm_poisson(
+                        numeric_cols,
+                        categorical_cols,
+                        use_gpu=use_gpu,
+                    ),
+                ),
+                ModelSpec(
+                    "catboost_poisson",
+                    "global_panel",
+                    lambda: make_catboost_poisson(
+                        numeric_cols,
+                        categorical_cols,
+                        use_gpu=use_gpu,
+                    ),
+                ),
+            ]
+        )
+
+    # RODS EV 是全國單序列，不要放太多一般 regression boosting
+    if is_rods_ev_national:
+        keep_names = {
+            "seasonal_naive",
+            "ridge",
+            "xgboost_poisson",
+            "lightgbm_poisson",
+            "catboost_poisson",
+        }
+
+        registry = [
+            spec for spec in registry
+            if spec.name in keep_names
+        ]
+
+    return registry
 
 
 def new_model(spec: ModelSpec):

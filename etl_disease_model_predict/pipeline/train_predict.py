@@ -33,6 +33,10 @@ from etl_disease_model_predict.utils.week import (
     forecast_yearweeks,
     latest_closed_yearweek,
 )
+from etl_disease_model_predict.features.dim_features import (
+    load_dim_location_mapping,
+    _normalize_location_name,
+)
 
 KEY_COLS = ["data_source", "disease", "county"]
 CATEGORICAL_COLS = ["county", "disease", "data_source"]
@@ -109,7 +113,6 @@ RUN_MODE_CONFIG = {
             "xgboost",
             "lightgbm",
             "catboost",
-            "keras_mlp",
         ],
     ),
     "forecast": RunModeConfig(
@@ -145,6 +148,55 @@ FEATURE_SET_CONFIG = {
     },
 }
 
+def _merge_ev_county_to_branch_t(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    將 EV 的 county 轉為 dim_location.branch_t。
+
+    使用 old_name / new_name 對照，避免 2005-2026 期間縣市名稱變動造成 mapping 失敗。
+    """
+    if df.empty:
+        return df.copy()
+
+    out = df.copy()
+
+    if "county" not in out.columns:
+        raise RuntimeError("EV branch mapping requires county column")
+
+    mapping = load_dim_location_mapping()
+
+    out["county_key"] = out["county"].apply(_normalize_location_name)
+
+    out = out.merge(
+        mapping[["county_key", "new_name", "branch_t"]],
+        on="county_key",
+        how="left",
+    )
+
+    missing = (
+        out.loc[out["branch_t"].isna(), "county"]
+        .dropna()
+        .astype(str)
+        .drop_duplicates()
+        .sort_values()
+        .tolist()
+    )
+
+    if missing:
+        raise RuntimeError(
+            "Some EV counties cannot map to dim_location.branch_t: "
+            f"{missing}"
+        )
+
+    out["county"] = out["branch_t"].astype(str)
+
+    out = out.drop(
+        columns=["county_key", "new_name", "branch_t"],
+        errors="ignore",
+    )
+
+    out = _collapse_panel_rows(out)
+
+    return out
 
 def _resolve_config(
     run_mode: str,
@@ -201,15 +253,19 @@ def add_lag_rolling_features(
         )
 
     for lag in cfg["diff_lags"]:
-        lag_col = f"lag_{lag}"
-        if lag_col in out.columns:
-            out[f"diff_{lag}"] = out["count"] - out[lag_col]
+        base_col = "lag_1"
+        compare_col = f"lag_{lag + 1}"
+
+        if base_col in out.columns and compare_col in out.columns:
+            out[f"diff_{lag}"] = out[base_col] - out[compare_col]
 
     for lag in cfg["growth_lags"]:
-        lag_col = f"lag_{lag}"
-        if lag_col in out.columns:
-            denom = out[lag_col].replace(0, np.nan)
-            out[f"growth_{lag}"] = (out["count"] - out[lag_col]) / denom
+        base_col = "lag_1"
+        compare_col = f"lag_{lag + 1}"
+
+        if base_col in out.columns and compare_col in out.columns:
+            denom = out[compare_col].replace(0, np.nan)
+            out[f"growth_{lag}"] = (out[base_col] - out[compare_col]) / denom
 
     # =====================================================
     # 2. source total count lag / rolling
@@ -410,17 +466,17 @@ def _prepare_feature_for_model_task(
     依照 modeling task 做模型前資料調整。
 
     model_task:
-        default
-            NHI_ER / NHI_OPD 使用，僅做離島整併。
+        nhi_ev_branch
+            NHI ER / OPD 的 EV 改為 branch_t 分區建模。
+
+        nhi_non_ev_county
+            NHI ER / OPD 的 DI / ILI 維持縣市建模，非本島整併為離島。
 
         rods_ev_national
-            RODS EV 獨立建模。
-            EV 全縣市加總為 county='全國'。
-            移除 weather features。
+            RODS EV 全國建模，移除 weather。
 
         rods_non_ev
-            RODS 非 EV。
-            縣市照舊，但非本島整併成「離島」。
+            RODS 非 EV 縣市建模，非本島整併為離島。
     """
     if feature.empty:
         return feature.copy(), []
@@ -428,8 +484,28 @@ def _prepare_feature_for_model_task(
     out = feature.copy()
     removed_weather_cols: list[str] = []
 
-    if data_source in {"nhi_er", "nhi_opd"}:
+    if data_source in {"nhi_er", "nhi_opd"} and model_task == "nhi_ev_branch":
+        out = out[out["disease"].astype(str) == "EV"].copy()
+
+        if out.empty:
+            raise RuntimeError(
+                f"{data_source} EV feature table is empty after filtering disease=EV"
+            )
+
+        out = _merge_ev_county_to_branch_t(out)
+
+        return out, removed_weather_cols
+
+    if data_source in {"nhi_er", "nhi_opd"} and model_task == "nhi_non_ev_county":
+        out = out[out["disease"].astype(str) != "EV"].copy()
+
+        if out.empty:
+            raise RuntimeError(
+                f"{data_source} non-EV feature table is empty after filtering disease!=EV"
+            )
+
         out = _merge_offshore_counties(out)
+
         return out, removed_weather_cols
 
     if data_source == "rods" and model_task == "rods_ev_national":
@@ -927,12 +1003,29 @@ def _fit_model_with_optional_grid_search(
     Global panel model 的 fit helper。
 
     保護機制：
-    1. y 全部相同時，直接使用 DummyRegressor。
-    2. GridSearch 失敗時，退回原模型 fit。
-    3. CatBoost 遇到 All train targets are equal 時，退回 DummyRegressor。
+        1. y 全部相同時，直接使用 DummyRegressor。
+        2. GridSearch 關閉時，直接 fit。
+        3. GridSearch 沒有參數表或 CV 不足時，直接 fit。
+        4. GridSearch 失敗時，退回原模型 fit。
+        5. CatBoost / 其他模型遇到 All train targets are equal 時，退回 DummyRegressor。
     """
     x = train_df[feature_cols]
     y = train_df[y_col].astype(float)
+
+    def _plain_fit():
+        try:
+            model.fit(x, y)
+            return model
+
+        except Exception as exc:
+            if _is_constant_target(y) or "All train targets are equal" in str(exc):
+                return _fit_constant_target_model(
+                    x=x,
+                    y=y,
+                    model_name=model_name,
+                )
+
+            raise
 
     if _is_constant_target(y):
         return _fit_constant_target_model(
@@ -942,33 +1035,13 @@ def _fit_model_with_optional_grid_search(
         )
 
     if not enable_grid_search:
-        try:
-            model.fit(x, y)
-            return model
-        except Exception as exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-            raise
+        return _plain_fit()
 
     param_grid = _param_grid_for_model(model_name)
     param_grid = _filter_valid_param_grid(model, param_grid)
 
     if not param_grid:
-        try:
-            model.fit(x, y)
-            return model
-        except Exception as exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-            raise
+        return _plain_fit()
 
     cv = _yearweek_cv_splits(
         train_df,
@@ -977,17 +1050,7 @@ def _fit_model_with_optional_grid_search(
     )
 
     if not cv:
-        try:
-            model.fit(x, y)
-            return model
-        except Exception as exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-            raise
+        return _plain_fit()
 
     print(
         f"[GRID] model={model_name}, "
@@ -1026,160 +1089,7 @@ def _fit_model_with_optional_grid_search(
             flush=True,
         )
 
-        try:
-            model.fit(x, y)
-            return model
-
-        except Exception as fit_exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-            raise
-
-    except Exception as exc:
-        if _is_constant_target(y) or "All train targets are equal" in str(exc):
-            return _fit_constant_target_model(
-                x=x,
-                y=y,
-                model_name=model_name,
-            )
-
-        raise
-
-    print(
-        f"[GRID] model={model_name}, "
-        f"candidates={np.prod([len(v) for v in param_grid.values()])}, "
-        f"cv_splits={len(cv)}",
-        flush=True,
-    )
-
-    try:
-        search = GridSearchCV(
-            estimator=model,
-            param_grid=param_grid,
-            scoring=WAPE_SCORER,
-            cv=cv,
-            n_jobs=1,
-            refit=True,
-            verbose=0,
-            error_score=np.nan,
-        )
-
-        search.fit(x, y)
-
-        print(
-            f"[GRID] model={model_name}, "
-            f"best_score={search.best_score_}, "
-            f"best_params={json.dumps(search.best_params_, ensure_ascii=False)}",
-            flush=True,
-        )
-
-        return search.best_estimator_
-
-    except ValueError as exc:
-        print(
-            f"[WARN] GridSearch failed for model={model_name}; "
-            f"fallback to plain fit. error={type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-        try:
-            model.fit(x, y)
-            return model
-
-        except Exception as fit_exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-            raise
-
-    except Exception as exc:
-        if _is_constant_target(y) or "All train targets are equal" in str(exc):
-            return _fit_constant_target_model(
-                x=x,
-                y=y,
-                model_name=model_name,
-            )
-        raise
-
-    param_grid = _param_grid_for_model(model_name)
-
-    if not param_grid:
-        try:
-            model.fit(x, y)
-            return model
-        except Exception as exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-
-            raise
-
-    if cv_splits is None or len(cv_splits) == 0:
-        try:
-            model.fit(x, y)
-            return model
-        except Exception as exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-
-            raise
-
-    try:
-        search = GridSearchCV(
-            estimator=model,
-            param_grid=param_grid,
-            scoring=WAPE_SCORER,
-            cv=cv_splits,
-            n_jobs=1,
-            refit=True,
-            error_score=np.nan,
-        )
-
-        search.fit(x, y)
-
-        print(
-            f"[GRID] model={model_name}, "
-            f"best_score={search.best_score_}, "
-            f"best_params={search.best_params_}",
-            flush=True,
-        )
-
-        return search.best_estimator_
-
-    except ValueError as exc:
-        print(
-            f"[WARN] GridSearch failed for model={model_name}; "
-            f"fallback to plain fit. error={type(exc).__name__}: {exc}",
-            flush=True,
-        )
-
-        try:
-            model.fit(x, y)
-            return model
-
-        except Exception as fit_exc:
-            if _is_constant_target(y) or "All train targets are equal" in str(fit_exc):
-                return _fit_constant_target_model(
-                    x=x,
-                    y=y,
-                    model_name=model_name,
-                )
-
-            raise
+        return _plain_fit()
 
     except Exception as exc:
         if _is_constant_target(y) or "All train targets are equal" in str(exc):
@@ -1320,6 +1230,9 @@ def _build_eval_metric_df(
         "covid_policy": covid_policy,
         "enable_grid_search": enable_grid_search,
         "prediction_type": "oof",
+        "metric_level": "unknown",
+        "disease": "ALL",
+        "county": "ALL",
         "created_at": now,
     }
 
@@ -1344,6 +1257,7 @@ def _build_eval_metric_df(
         # overall
         context = model_context.copy()
         context["metric_level"] = "overall"
+        
         rows.append(
             _metric_row(
                 tmp["y_true"],
@@ -1413,7 +1327,17 @@ def _build_eval_metric_df(
         context["county"] = county
         rows.append(_metric_row(g["y_true"], g["y_pred"], context))
 
-    return pd.DataFrame(rows)
+    metric_df = pd.DataFrame(rows)
+
+    for col in ["metric_level", "disease", "county"]:
+        if col not in metric_df.columns:
+            metric_df[col] = "ALL"
+
+    metric_df["metric_level"] = metric_df["metric_level"].fillna("unknown")
+    metric_df["disease"] = metric_df["disease"].fillna("ALL")
+    metric_df["county"] = metric_df["county"].fillna("ALL")
+
+    return metric_df
 
 def _fit_predict_global_oof(
     train: pd.DataFrame,
@@ -1514,6 +1438,87 @@ def _fit_predict_local_oof(
 
     return oof
 
+def _fit_predict_meta_oof(
+    oof_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    yearweek_valid: pd.Series,
+    method: str,
+    n_splits: int,
+    min_train_weeks: int = 12,
+) -> np.ndarray:
+    """
+    對 meta model 做 rolling OOF。
+
+    目的：
+        避免用同一批 base OOF 訓練 meta model 後，
+        又回頭預測同一批資料，造成 stacking metric 過度樂觀。
+
+    注意：
+        這是 meta 層級的 OOF，不是重新訓練 base model。
+    """
+    x = oof_valid.reset_index(drop=True).copy()
+    y = pd.to_numeric(y_valid.reset_index(drop=True), errors="coerce")
+    weeks = pd.to_numeric(yearweek_valid.reset_index(drop=True), errors="coerce")
+
+    work = pd.DataFrame(
+        {
+            "yearweek": weeks,
+            "count": y,
+        }
+    )
+
+    mask = work["yearweek"].notna() & work["count"].notna()
+
+    for col in x.columns:
+        x[col] = pd.to_numeric(x[col], errors="coerce")
+        mask &= x[col].notna()
+
+    x = x.loc[mask].reset_index(drop=True)
+    work = work.loc[mask].reset_index(drop=True)
+
+    pred = np.full(len(oof_valid), np.nan, dtype=float)
+
+    if x.empty:
+        return pred
+
+    try:
+        splits = _rolling_splits(
+            work,
+            n_splits=max(2, min(n_splits, 5)),
+            min_train_weeks=min_train_weeks,
+        )
+    except Exception:
+        return pred
+
+    original_positions = np.where(mask.to_numpy())[0]
+
+    for tr_idx, va_idx in splits:
+        if len(tr_idx) == 0 or len(va_idx) == 0:
+            continue
+
+        try:
+            meta_fold = fit_meta_model(
+                x.loc[tr_idx],
+                work.loc[tr_idx, "count"],
+                method=method,
+            )
+
+            fold_pred = predict_meta(
+                meta_fold,
+                x.loc[va_idx],
+            )
+
+            pred[original_positions[va_idx]] = fold_pred
+
+        except Exception as exc:
+            print(
+                f"[WARN] meta OOF failed: "
+                f"method={method}, "
+                f"error={type(exc).__name__}: {exc}",
+                flush=True,
+            )
+
+    return pred
 
 def _fit_final_base_predictions(
     train: pd.DataFrame,
@@ -1689,6 +1694,31 @@ def run_source(
     )
 
     exog_cols = get_exog_columns(feature)
+
+    # 避免目標洩漏：
+    # source_total_count 與 disease_rate 會直接或間接包含當週 count，
+    # 只能使用 add_lag_rolling_features() 產生的 lag / rolling 版本，
+    # 不能把原始同週欄位放進模型特徵。
+    target_derived_exog_cols = {
+        "source_total_count",
+        "disease_rate",
+    }
+    leaked_exog_cols = [
+        c for c in exog_cols
+        if c in target_derived_exog_cols
+    ]
+    if leaked_exog_cols:
+        print(
+            f"[LEAKAGE_GUARD] source={data_source}, "
+            f"model_task={model_task}, "
+            f"removed_exog_cols={leaked_exog_cols}",
+            flush=True,
+        )
+
+    exog_cols = [
+        c for c in exog_cols
+        if c not in target_derived_exog_cols
+    ]
     forecast_weeks = forecast_yearweeks(forecast_period)
     train_cut_week = latest_closed_yearweek()
 
@@ -1782,8 +1812,46 @@ def run_source(
         numeric_cols=selected_numeric_cols,
         categorical_cols=categorical_cols,
         use_gpu=use_gpu,
-        model_names=cfg.model_names + (["sarimax"] if enable_sarimax else []),
-        enable_sarimax=enable_sarimax,
+        model_task=model_task,
+    )
+
+    allowed_model_names = set(cfg.model_names) - {"keras_mlp"}
+
+    if model_task in {"nhi_ev_branch", "rods_ev_national"}:
+        allowed_model_names.discard("ridge")
+
+        allowed_model_names.update(
+            {
+                "xgboost_poisson",
+                "lightgbm_poisson",
+                "catboost_poisson",
+            }
+        )
+
+    if enable_sarimax:
+        allowed_model_names.add("sarimax")
+    else:
+        allowed_model_names.discard("sarimax")
+
+    registry = [
+        spec
+        for spec in registry
+        if spec.name in allowed_model_names
+    ]
+
+    if len(registry) < 2:
+        raise RuntimeError(
+            f"Need at least 2 models after registry filtering, "
+            f"got {len(registry)} for source={data_source}, "
+            f"model_task={model_task}, "
+            f"models={[spec.name for spec in registry]}"
+        )
+
+    print(
+        f"[MODEL_POOL] source={data_source}, "
+        f"model_task={model_task}, "
+        f"models={[spec.name for spec in registry]}",
+        flush=True,
     )
 
     print(
@@ -1831,26 +1899,58 @@ def run_source(
             f"got {oof.shape[1]} for source={data_source}"
         )
 
-    meta = fit_meta_model(
-        oof.loc[valid_mask],
-        train.loc[valid_mask, "count"],
+    oof_valid = oof.loc[valid_mask].copy()
+    y_valid = train.loc[valid_mask, "count"].copy()
+    yearweek_valid = train.loc[valid_mask, "yearweek"].copy()
+
+    stacked_oof = _fit_predict_meta_oof(
+        oof_valid=oof_valid,
+        y_valid=y_valid,
+        yearweek_valid=yearweek_valid,
         method=meta_model,
+        n_splits=cfg.n_splits,
+        min_train_weeks=12,
     )
 
-    stacked_oof = predict_meta(meta, oof.loc[valid_mask])
+    if np.isnan(stacked_oof).all():
+        print(
+            f"[WARN] honest meta OOF unavailable; "
+            f"fallback to in-sample meta metric. "
+            f"source={data_source}, model_task={model_task}, meta_model={meta_model}",
+            flush=True,
+        )
+
+        meta_eval_type = "insample_meta"
+        meta = fit_meta_model(
+            oof_valid,
+            y_valid,
+            method=meta_model,
+        )
+        stacked_oof = predict_meta(meta, oof_valid)
+
+    else:
+        meta_eval_type = "rolling_meta_oof"
+
+        meta = fit_meta_model(
+            oof_valid,
+            y_valid,
+            method=meta_model,
+        )
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    model_scope = (
-        "national"
-        if model_task == "rods_ev_national"
-        else "county"
-    )
+    if model_task == "rods_ev_national":
+        model_scope = "national"
+    elif model_task == "nhi_ev_branch":
+        model_scope = "branch"
+    else:
+        model_scope = "county"
 
     is_rods_ev_national = model_task == "rods_ev_national"
 
     is_offshore_collapsed = model_task in {
         "default",
+        "nhi_non_ev_county",
         "rods_non_ev",
     }
 
@@ -1876,7 +1976,12 @@ def run_source(
     metric_df["is_rods_ev_national"] = is_rods_ev_national
     metric_df["is_offshore_collapsed"] = is_offshore_collapsed
     metric_df["weather_removed"] = weather_removed
-
+    metric_df["meta_model"] = meta_model
+    metric_df["meta_eval_type"] = np.where(
+        metric_df["model_layer"].eq("stacking"),
+        meta_eval_type,
+        "base_oof",
+    )
     future_base = _fit_final_base_predictions(
         train=train,
         future=future,
@@ -1894,22 +1999,51 @@ def run_source(
         future_base = future_base.fillna(future_base.median(numeric_only=True))
         future_base = future_base.fillna(0)
 
-    final_pred = predict_meta(meta, future_base)
+    stacked_future_pred = predict_meta(meta, future_base)
 
-    model_scope = (
-        "national"
-        if model_task == "rods_ev_national"
-        else "county"
+    # 注意：
+    # stacked_oof 是 meta model 在同一批 OOF base features 上訓練後再預測同一批資料，
+    # 這不是 honest meta OOF，容易讓 stacking 的評估過度樂觀。
+    # 因此 final model selection 只用 base model 的 overall WAPE。
+    # stacking 仍保留在 metric_df 裡作參考，但不作為自動選模依據。
+    overall_metric = metric_df.loc[
+        metric_df["metric_level"].eq("overall")
+        & metric_df["model_layer"].eq("base")
+    ].copy()
+
+    overall_metric = overall_metric[
+        overall_metric["WAPE"].notna()
+        & np.isfinite(overall_metric["WAPE"])
+    ].copy()
+
+    if overall_metric.empty:
+        final_pred = stacked_future_pred
+        final_model_name = f"stacking_{meta_model}"
+        final_model_layer = "stacking"
+        best_wape = np.nan
+    else:
+        overall_metric = overall_metric.sort_values("WAPE", ascending=True)
+
+        best_row = overall_metric.iloc[0]
+        best_model_name = best_row.get("model_name")
+        best_wape = best_row.get("WAPE")
+
+        if best_model_name in future_base.columns:
+            final_pred = future_base[best_model_name].to_numpy()
+            final_model_name = str(best_model_name)
+            final_model_layer = "base"
+        else:
+            final_pred = stacked_future_pred
+            final_model_name = f"stacking_{meta_model}"
+            final_model_layer = "stacking"
+
+    print(
+        f"[FINAL_MODEL] source={data_source}, "
+        f"model_task={model_task}, "
+        f"final_model={final_model_layer}/{final_model_name}, "
+        f"best_base_oof_wape={best_wape}",
+        flush=True,
     )
-
-    is_rods_ev_national = model_task == "rods_ev_national"
-
-    is_offshore_collapsed = model_task in {
-        "default",
-        "rods_non_ev",
-    }
-
-    weather_removed = len(removed_weather_cols) > 0
 
     id_cols = KEY_COLS + ["yearweek"]
 
@@ -1919,7 +2053,8 @@ def run_source(
         np.clip(np.rint(forecast_df["forecast_count"].fillna(0)), 0, None)
         .astype(int)
     )
-    forecast_df["model_name"] = f"stacking_{meta_model}"
+    forecast_df["model_name"] = final_model_name
+    forecast_df["model_layer"] = final_model_layer
     forecast_df["model_task"] = model_task
     forecast_df["model_scope"] = model_scope
     forecast_df["is_rods_ev_national"] = is_rods_ev_national
@@ -2021,16 +2156,34 @@ def run_source(
 
 def _expand_model_tasks(data_sources: list[str]) -> list[dict]:
     """
-    將使用者指定的 data_sources 展開成實際 modeling tasks。
+    將 data_sources 展開成實際 modeling tasks。
 
-    rods 會拆成兩個任務：
-        1. rods_ev_national
-        2. rods_non_ev
+    NHI：
+        EV      → branch_t 分區
+        non-EV  → county
+
+    RODS：
+        EV      → national
+        non-EV  → county
     """
     tasks = []
 
     for source in data_sources:
-        if source == "rods":
+        if source in {"nhi_er", "nhi_opd"}:
+            tasks.append(
+                {
+                    "data_source": source,
+                    "model_task": "nhi_ev_branch",
+                }
+            )
+            tasks.append(
+                {
+                    "data_source": source,
+                    "model_task": "nhi_non_ev_county",
+                }
+            )
+
+        elif source == "rods":
             tasks.append(
                 {
                     "data_source": "rods",
@@ -2043,6 +2196,7 @@ def _expand_model_tasks(data_sources: list[str]) -> list[dict]:
                     "model_task": "rods_non_ev",
                 }
             )
+
         else:
             tasks.append(
                 {

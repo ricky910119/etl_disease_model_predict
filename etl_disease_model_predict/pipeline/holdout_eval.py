@@ -866,7 +866,129 @@ def main():
     ]
     print(summary[show_cols].to_string(index=False))
     print("=========================================\n")
+from types import SimpleNamespace
 
+
+def run_holdout_all(
+    data_sources: list[str],
+    end_week: int,
+    holdout_weeks: int,
+    plot_weeks: int,
+    start_week: int | None,
+    recent_weeks: int | None,
+    run_mode: str,
+    feature_set: str | None,
+    feature_select: str | None,
+    top_k: int | None,
+    covid_policy: str,
+    enable_grid_search: bool,
+    grid_cv_splits: int,
+    use_gpu: bool = False,
+    enable_sarimax: bool = False,
+    meta_model: str = "ridge",
+    output_dir: Path | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    給 main.py 呼叫的 holdout 統一入口。
+
+    回傳格式與 train_predict.run_all() 一致：
+        forecast_df, base_df, metric_df, selected_df
+    """
+    if output_dir is None:
+        output_dir = Path(f"outputs/holdout_{holdout_weeks}w")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    setup_chinese_font()
+
+    args = SimpleNamespace(
+        sources=data_sources,
+        end_week=end_week,
+        holdout_weeks=holdout_weeks,
+        plot_weeks=plot_weeks,
+        start_week=start_week,
+        recent_weeks=recent_weeks,
+        run_mode=run_mode,
+        feature_set=feature_set,
+        feature_select=feature_select,
+        top_k=top_k,
+        covid_policy=covid_policy,
+        enable_grid_search=enable_grid_search,
+        grid_cv_splits=grid_cv_splits,
+        meta_model=meta_model,
+        use_gpu=use_gpu,
+        enable_sarimax=enable_sarimax,
+        output_dir=str(output_dir),
+    )
+
+    tasks = _expand_model_tasks(data_sources)
+
+    all_holdout = []
+    all_base = []
+    all_metrics = []
+    all_selected = []
+
+    for task in tasks:
+        h, b, m, s = run_task(
+            args=args,
+            task=task,
+            output_dir=output_dir,
+        )
+
+        all_holdout.append(h)
+        all_base.append(b)
+        all_metrics.append(m)
+        all_selected.append(s)
+
+    forecast_df = (
+        pd.concat(all_holdout, ignore_index=True)
+        if all_holdout
+        else pd.DataFrame()
+    )
+
+    base_df = (
+        pd.concat(all_base, ignore_index=True)
+        if all_base
+        else pd.DataFrame()
+    )
+
+    metric_df = (
+        pd.concat(all_metrics, ignore_index=True)
+        if all_metrics
+        else pd.DataFrame()
+    )
+
+    selected_df = (
+        pd.concat(all_selected, ignore_index=True)
+        if all_selected
+        else pd.DataFrame()
+    )
+
+    if not forecast_df.empty:
+        forecast_df = forecast_df.sort_values(
+            ["data_source", "model_task", "disease", "county", "yearweek"]
+        )
+
+    if not base_df.empty:
+        base_df = base_df.sort_values(
+            ["data_source", "model_task", "base_model", "disease", "county", "yearweek"]
+        )
+
+    if not metric_df.empty and "WAPE" in metric_df.columns:
+        sort_cols = [
+            c for c in [
+                "data_source",
+                "model_task",
+                "model_layer",
+                "model_name",
+                "metric_level",
+                "WAPE",
+            ]
+            if c in metric_df.columns
+        ]
+        metric_df = metric_df.sort_values(sort_cols)
+
+    return forecast_df, base_df, metric_df, selected_df
 
 if __name__ == "__main__":
     main()

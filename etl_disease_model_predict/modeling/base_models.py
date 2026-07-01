@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 
 import numpy as np
@@ -17,6 +20,49 @@ try:
     from pmdarima import auto_arima
 except Exception:  # pragma: no cover
     auto_arima = None
+
+
+@lru_cache(maxsize=1)
+def _cuda_available() -> bool:
+    """
+    輕量偵測目前主機是否有可用的 NVIDIA GPU。
+
+    只用 nvidia-smi 探測，不 import torch / cupy 等重量套件，
+    結果會快取，同一次執行只偵測一次。
+    """
+    if shutil.which("nvidia-smi") is None:
+        return False
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
+    except Exception:
+        return False
+
+
+def _resolve_use_gpu(use_gpu: bool, model_name: str) -> bool:
+    """
+    依實際硬體可用性決定某個模型是否真的啟用 GPU。
+
+    use_gpu=True 但偵測不到可用 GPU 時，自動退回 CPU 並記錄清楚訊息，
+    確保 --use-gpu 不會讓程式變成必須有 GPU 才能執行。
+    """
+    if not use_gpu:
+        return False
+
+    if _cuda_available():
+        return True
+
+    print(
+        f"[WARN] use_gpu=True 但偵測不到可用的 NVIDIA GPU，{model_name} 自動改用 CPU。",
+        flush=True,
+    )
+    return False
 
 
 @dataclass(frozen=True)
@@ -300,7 +346,8 @@ def make_xgboost(
     try:
         from xgboost import XGBRegressor
 
-        kwargs = {} if use_gpu else {}
+        effective_gpu = _resolve_use_gpu(use_gpu, "xgboost")
+        kwargs = {"device": "cuda"} if effective_gpu else {}
 
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
@@ -338,6 +385,8 @@ def make_lightgbm(
     try:
         from lightgbm import LGBMRegressor
 
+        effective_gpu = _resolve_use_gpu(use_gpu, "lightgbm")
+
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
             _as_numpy_transformer(),
@@ -348,7 +397,7 @@ def make_lightgbm(
                 subsample=0.85,
                 colsample_bytree=0.85,
                 objective="regression",
-                device_type="cpu" ,
+                device_type="gpu" if effective_gpu else "cpu",
                 random_state=9101,
                 n_jobs=-1,
                 verbose=-1,
@@ -374,6 +423,8 @@ def make_catboost(
     try:
         from catboost import CatBoostRegressor
 
+        effective_gpu = _resolve_use_gpu(use_gpu, "catboost")
+
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
             _as_numpy_transformer(),
@@ -382,7 +433,7 @@ def make_catboost(
                 depth=5,
                 learning_rate=0.04,
                 loss_function="RMSE",
-                task_type="CPU",
+                task_type="GPU" if effective_gpu else "CPU",
                 random_seed=9101,
                 verbose=False,
             ),
@@ -405,9 +456,8 @@ def make_xgboost_poisson(
     try:
         from xgboost import XGBRegressor
 
-        kwargs = {}
-        if use_gpu:
-            kwargs["device"] = "cuda"
+        effective_gpu = _resolve_use_gpu(use_gpu, "xgboost_poisson")
+        kwargs = {"device": "cuda"} if effective_gpu else {}
 
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
@@ -444,6 +494,8 @@ def make_lightgbm_poisson(
     try:
         from lightgbm import LGBMRegressor
 
+        effective_gpu = _resolve_use_gpu(use_gpu, "lightgbm_poisson")
+
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
             LGBMRegressor(
@@ -453,7 +505,7 @@ def make_lightgbm_poisson(
                 subsample=0.85,
                 colsample_bytree=0.85,
                 objective="poisson",
-                device_type="gpu" if use_gpu else "cpu",
+                device_type="gpu" if effective_gpu else "cpu",
                 random_state=9101,
                 n_jobs=-1,
                 verbose=-1,
@@ -479,6 +531,8 @@ def make_catboost_poisson(
     try:
         from catboost import CatBoostRegressor
 
+        effective_gpu = _resolve_use_gpu(use_gpu, "catboost_poisson")
+
         return make_pipeline(
             make_preprocessor(numeric_cols, categorical_cols),
             CatBoostRegressor(
@@ -486,7 +540,7 @@ def make_catboost_poisson(
                 depth=4,
                 learning_rate=0.03,
                 loss_function="Poisson",
-                task_type="GPU" if use_gpu else "CPU",
+                task_type="GPU" if effective_gpu else "CPU",
                 random_seed=9101,
                 verbose=False,
             ),
@@ -600,12 +654,17 @@ def build_base_registry(
     不改資料粒度，只依 model_task 決定模型池。
 
     EV task:
-        使用 count-oriented models。
+        使用 count-oriented models，額外加入 poisson 系列模型。
+        排除 elasticnet（EV 任務上表現明顯不穩定，WAPE 常遠高於其他模型）。
         不使用 keras_mlp。
 
     non-EV task:
-        使用原本穩定模型。
+        使用原本穩定模型組合。
         不使用 keras_mlp。
+
+    RODS EV（rods_ev_national）:
+        資料為全國單一序列，進一步縮小成 seasonal_naive / ridge / poisson 系列，
+        避免放入太多容易在稀疏資料上不穩定的一般 regression boosting 模型。
     """
     is_ev_task = model_task in {
         "nhi_ev_branch",
@@ -629,6 +688,7 @@ def build_base_registry(
             "elasticnet",
             "global_panel",
             lambda: make_elasticnet(numeric_cols, categorical_cols),
+            enabled=not is_ev_task,
         ),
         ModelSpec(
             "xgboost",
@@ -646,6 +706,10 @@ def build_base_registry(
             lambda: make_catboost(numeric_cols, categorical_cols, use_gpu=use_gpu),
         ),
     ]
+
+    # elasticnet 在 EV 任務上表現明顯不穩定（WAPE 常遠高於其他模型），
+    # 這裡直接把它標記為不啟用，之後在 registry 過濾階段就會被排除，不會進入 stacking。
+    registry = [spec for spec in registry if spec.enabled]
 
     # EV 才加入 count-based boosting
     if is_ev_task:

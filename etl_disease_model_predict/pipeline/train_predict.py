@@ -253,19 +253,19 @@ def add_lag_rolling_features(
         )
 
     for lag in cfg["diff_lags"]:
-        base_col = "lag_1"
-        compare_col = f"lag_{lag + 1}"
-
-        if base_col in out.columns and compare_col in out.columns:
-            out[f"diff_{lag}"] = out[base_col] - out[compare_col]
+        # diff_lag 定義為「最近一期已知值」與「lag+1 週前已知值」的差，
+        # 兩者都在目標週之前，不會用到當週 count，避免 target leakage。
+        # 這裡直接用 shift(lag + 1) 取比較值，不依賴 lag_(lag+1) 是否剛好
+        # 也在 cfg["lags"] 清單中，確保設定的 diff_lags 都能真正產生對應欄位。
+        compare_series = count_grp.shift(lag + 1)
+        out[f"diff_{lag}"] = out["lag_1"] - compare_series
 
     for lag in cfg["growth_lags"]:
-        base_col = "lag_1"
-        compare_col = f"lag_{lag + 1}"
-
-        if base_col in out.columns and compare_col in out.columns:
-            denom = out[compare_col].replace(0, np.nan)
-            out[f"growth_{lag}"] = (out[base_col] - out[compare_col]) / denom
+        # growth_lag 定義與 diff_lag 相同的比較基準，
+        # 分母同樣是 lag+1 週前已知值，避免除以當週 count。
+        compare_series = count_grp.shift(lag + 1)
+        denom = compare_series.replace(0, np.nan)
+        out[f"growth_{lag}"] = (out["lag_1"] - compare_series) / denom
 
     # =====================================================
     # 2. source total count lag / rolling
@@ -679,21 +679,39 @@ def _recursive_future_features(
 
         # =====================================================
         # 3. count diff / growth
+        #    定義與訓練時完全一致：base 為 lag_1（最近一期已知值），
+        #    compare 為 lag_(lag+1)（lag+1 週前已知值），
+        #    直接從 count_history 取值，不透過 item 裡的 lag_{lag} 欄位，
+        #    避免與訓練定義產生一位之差。
         # =====================================================
+        base_value = item.get("lag_1", np.nan)
+
         for lag in cfg["diff_lags"]:
-            lag_value = item.get(f"lag_{lag}", np.nan)
+            compare_value = (
+                count_history[-(lag + 1)]
+                if len(count_history) >= lag + 1
+                else np.nan
+            )
 
             item[f"diff_{lag}"] = (
-                current_proxy - lag_value
-                if pd.notna(lag_value)
+                base_value - compare_value
+                if pd.notna(base_value) and pd.notna(compare_value)
                 else np.nan
             )
 
         for lag in cfg["growth_lags"]:
-            lag_value = item.get(f"lag_{lag}", np.nan)
+            compare_value = (
+                count_history[-(lag + 1)]
+                if len(count_history) >= lag + 1
+                else np.nan
+            )
 
-            if pd.notna(lag_value) and lag_value != 0:
-                item[f"growth_{lag}"] = (current_proxy - lag_value) / lag_value
+            if (
+                pd.notna(base_value)
+                and pd.notna(compare_value)
+                and compare_value != 0
+            ):
+                item[f"growth_{lag}"] = (base_value - compare_value) / compare_value
             else:
                 item[f"growth_{lag}"] = np.nan
 
@@ -1199,11 +1217,7 @@ def _metric_row(
     return row
 
 
-def _build_eval_metric_df(
-    train: pd.DataFrame,
-    oof: pd.DataFrame,
-    stacked_oof: np.ndarray,
-    valid_mask: pd.Series,
+def _make_base_metric_context(
     data_source: str,
     run_mode: str,
     feature_set: str,
@@ -1211,17 +1225,9 @@ def _build_eval_metric_df(
     top_k: int | None,
     covid_policy: str,
     enable_grid_search: bool,
-    meta_model: str,
     now: str,
-) -> pd.DataFrame:
-    """
-    建立模型測試用 metric_df。
-
-    不輸出 OOF 明細，只輸出聚合後的模型效能。
-    """
-    rows = []
-
-    base_context = {
+) -> dict:
+    return {
         "data_source": data_source,
         "run_mode": run_mode,
         "feature_set": feature_set,
@@ -1236,16 +1242,30 @@ def _build_eval_metric_df(
         "created_at": now,
     }
 
-    eval_df = train.loc[valid_mask, KEY_COLS + ["yearweek", "count"]].copy()
-    eval_df = eval_df.rename(columns={"count": "y_true"})
 
-    # -----------------------------
-    # base model metrics
-    # -----------------------------
+def _build_base_metric_rows(
+    train: pd.DataFrame,
+    oof: pd.DataFrame,
+    base_context: dict,
+) -> list[dict]:
+    """
+    建立 base model 的 metric rows。
+
+    跟 meta model 選擇無關，一個 data_source/model_task 只需要算一次，
+    比較多個 meta model 時可以重複使用同一份結果，不用重算。
+
+    每個 base model 各自使用自己的 OOF 有效列（notna），
+    不會因為另一個模型（例如 sarimax 只在序列夠長時才有預測）缺值，
+    就連帶縮小其他模型的評估樣本。
+    """
+    rows: list[dict] = []
+    id_cols = KEY_COLS + ["yearweek", "count"]
+
     for model_name in oof.columns:
-        tmp = eval_df.copy()
-        tmp["y_pred"] = oof.loc[valid_mask, model_name].values
-        tmp = tmp.loc[tmp["y_pred"].notna()].copy()
+        model_mask = oof[model_name].notna()
+
+        tmp = train.loc[model_mask, id_cols].rename(columns={"count": "y_true"}).copy()
+        tmp["y_pred"] = oof.loc[model_mask, model_name].values
 
         if tmp.empty:
             continue
@@ -1254,33 +1274,22 @@ def _build_eval_metric_df(
         model_context["model_layer"] = "base"
         model_context["model_name"] = model_name
 
-        # overall
         context = model_context.copy()
         context["metric_level"] = "overall"
-        
-        rows.append(
-            _metric_row(
-                tmp["y_true"],
-                tmp["y_pred"],
-                context,
-            )
-        )
+        rows.append(_metric_row(tmp["y_true"], tmp["y_pred"], context))
 
-        # by disease
         for disease, g in tmp.groupby("disease", dropna=False):
             context = model_context.copy()
             context["metric_level"] = "by_disease"
             context["disease"] = disease
             rows.append(_metric_row(g["y_true"], g["y_pred"], context))
 
-        # by county
         for county, g in tmp.groupby("county", dropna=False):
             context = model_context.copy()
             context["metric_level"] = "by_county"
             context["county"] = county
             rows.append(_metric_row(g["y_true"], g["y_pred"], context))
 
-        # by disease + county
         for (disease, county), g in tmp.groupby(
             ["disease", "county"],
             dropna=False,
@@ -1291,10 +1300,26 @@ def _build_eval_metric_df(
             context["county"] = county
             rows.append(_metric_row(g["y_true"], g["y_pred"], context))
 
-    # -----------------------------
-    # stacking model metrics
-    # -----------------------------
-    stack_df = eval_df.copy()
+    return rows
+
+
+def _build_stacking_metric_rows(
+    train: pd.DataFrame,
+    stack_valid_mask: pd.Series,
+    stacked_oof: np.ndarray,
+    meta_model: str,
+    base_context: dict,
+) -> list[dict]:
+    """
+    建立單一 meta model 的 stacking metric rows。
+
+    每比較一個 meta model 就呼叫一次，因為 base model 的部分
+    （_build_base_metric_rows）不會重複計算，這裡開銷很小。
+    """
+    rows: list[dict] = []
+    id_cols = KEY_COLS + ["yearweek", "count"]
+
+    stack_df = train.loc[stack_valid_mask, id_cols].rename(columns={"count": "y_true"}).copy()
     stack_df["y_pred"] = stacked_oof
 
     stack_context = base_context.copy()
@@ -1327,6 +1352,11 @@ def _build_eval_metric_df(
         context["county"] = county
         rows.append(_metric_row(g["y_true"], g["y_pred"], context))
 
+    return rows
+
+
+def _finalize_metric_df(rows: list[dict]) -> pd.DataFrame:
+    """把 metric rows 組成 DataFrame，並確保 metric_level/disease/county 不缺值。"""
     metric_df = pd.DataFrame(rows)
 
     for col in ["metric_level", "disease", "county"]:
@@ -1338,6 +1368,47 @@ def _build_eval_metric_df(
     metric_df["county"] = metric_df["county"].fillna("ALL")
 
     return metric_df
+
+
+def _build_eval_metric_df(
+    train: pd.DataFrame,
+    oof: pd.DataFrame,
+    stacked_oof: np.ndarray,
+    stack_valid_mask: pd.Series,
+    data_source: str,
+    run_mode: str,
+    feature_set: str,
+    feature_select: str,
+    top_k: int | None,
+    covid_policy: str,
+    enable_grid_search: bool,
+    meta_model: str,
+    now: str,
+) -> pd.DataFrame:
+    """
+    建立單一 meta model 情境下的完整 metric_df（base + 這個 meta model 的 stacking）。
+
+    內部呼叫 _build_base_metric_rows() 與 _build_stacking_metric_rows()，
+    只是把兩者組起來，維持舊有單一 meta model 呼叫方式的相容性。
+    比較多個 meta model 時請改用這兩個拆開的函式，避免 base rows 重算。
+    """
+    base_context = _make_base_metric_context(
+        data_source=data_source,
+        run_mode=run_mode,
+        feature_set=feature_set,
+        feature_select=feature_select,
+        top_k=top_k,
+        covid_policy=covid_policy,
+        enable_grid_search=enable_grid_search,
+        now=now,
+    )
+
+    rows = _build_base_metric_rows(train, oof, base_context)
+    rows += _build_stacking_metric_rows(
+        train, stack_valid_mask, stacked_oof, meta_model, base_context
+    )
+
+    return _finalize_metric_df(rows)
 
 def _fit_predict_global_oof(
     train: pd.DataFrame,
@@ -1520,6 +1591,66 @@ def _fit_predict_meta_oof(
 
     return pred
 
+
+@dataclass(frozen=True)
+class MetaModelResult:
+    """單一 meta model 的評估結果，供多 meta model 比較時使用。"""
+    method: str
+    stacked_oof: np.ndarray
+    meta: object
+    meta_eval_type: str
+
+
+def _evaluate_meta_models(
+    oof_valid: pd.DataFrame,
+    y_valid: pd.Series,
+    yearweek_valid: pd.Series,
+    methods: list[str],
+    n_splits: int,
+) -> dict[str, MetaModelResult]:
+    """
+    對多個 meta model 方法各自做 rolling OOF 評估，重複使用同一份 base OOF。
+
+    base model（xgboost/lightgbm/catboost...）只需要在呼叫這個函式之前訓練一次，
+    這裡只針對 meta model 這一層（輸入欄位數 = base model 數量，通常很小）重複訓練，
+    比每個 meta model 都重跑一次完整 pipeline 快得多，也是 --compare-meta-models
+    的效能基礎。
+    """
+    results: dict[str, MetaModelResult] = {}
+
+    for method in methods:
+        stacked_oof = _fit_predict_meta_oof(
+            oof_valid=oof_valid,
+            y_valid=y_valid,
+            yearweek_valid=yearweek_valid,
+            method=method,
+            n_splits=n_splits,
+            min_train_weeks=12,
+        )
+
+        if np.isnan(stacked_oof).all():
+            print(
+                f"[WARN] honest meta OOF unavailable for meta_model={method}; "
+                f"fallback to in-sample meta metric.",
+                flush=True,
+            )
+            meta_eval_type = "insample_meta"
+            meta = fit_meta_model(oof_valid, y_valid, method=method)
+            stacked_oof = predict_meta(meta, oof_valid)
+        else:
+            meta_eval_type = "rolling_meta_oof"
+            meta = fit_meta_model(oof_valid, y_valid, method=method)
+
+        results[method] = MetaModelResult(
+            method=method,
+            stacked_oof=stacked_oof,
+            meta=meta,
+            meta_eval_type=meta_eval_type,
+        )
+
+    return results
+
+
 def _fit_final_base_predictions(
     train: pd.DataFrame,
     future: pd.DataFrame,
@@ -1615,6 +1746,179 @@ def _fit_final_base_predictions(
     return future_pred
 
 
+def resolve_task_metadata(model_task: str) -> dict:
+    """
+    依 model_task 決定輸出用的中繼資料。
+
+    這裡是唯一定義 model_scope / is_rods_ev_national / is_offshore_collapsed
+    的地方，train_predict.run_source() 與 holdout_eval.run_task() 都呼叫這個
+    函式，避免兩邊各自重複實作而彼此漂移不一致。
+
+    model_scope：
+        rods_ev_national → national
+        nhi_ev_branch     → branch
+        其他（county 建模） → county
+    """
+    if model_task == "rods_ev_national":
+        model_scope = "national"
+    elif model_task == "nhi_ev_branch":
+        model_scope = "branch"
+    else:
+        model_scope = "county"
+
+    return {
+        "model_scope": model_scope,
+        "is_rods_ev_national": model_task == "rods_ev_national",
+        "is_offshore_collapsed": model_task in {
+            "default",
+            "nhi_non_ev_county",
+            "rods_non_ev",
+        },
+    }
+
+
+def resolve_allowed_registry(
+    numeric_cols: list[str],
+    categorical_cols: list[str],
+    model_task: str,
+    cfg_model_names: list[str],
+    use_gpu: bool = False,
+    enable_sarimax: bool = False,
+) -> list:
+    """
+    建立並篩選出實際要使用的 base model registry。
+
+    這裡是唯一決定「哪些模型會真正參與 OOF / stacking」的地方，
+    train_predict.run_source() 與 holdout_eval.run_task() 都呼叫這個函式，
+    避免各自實作 allowed_model_names 篩選邏輯而彼此不一致。
+
+    篩選規則：
+        1. 從 run_mode 設定的 model_names 開始（排除尚未正式啟用的 keras_mlp）。
+        2. EV 任務（nhi_ev_branch / rods_ev_national）額外加入 poisson 系列模型，
+           並移除 ridge（count-oriented 模型在 EV 任務上通常更穩定）。
+           elasticnet 已經在 build_base_registry() 依 model_task 排除，這裡不用重複處理。
+        3. enable_sarimax 決定是否加入 sarimax。
+    """
+    registry = build_base_registry(
+        numeric_cols=numeric_cols,
+        categorical_cols=categorical_cols,
+        use_gpu=use_gpu,
+        model_task=model_task,
+    )
+
+    allowed_model_names = set(cfg_model_names) - {"keras_mlp"}
+
+    if model_task in {"nhi_ev_branch", "rods_ev_national"}:
+        allowed_model_names.discard("ridge")
+        allowed_model_names.update(
+            {
+                "xgboost_poisson",
+                "lightgbm_poisson",
+                "catboost_poisson",
+            }
+        )
+
+    if enable_sarimax:
+        allowed_model_names.add("sarimax")
+    else:
+        allowed_model_names.discard("sarimax")
+
+    registry = [spec for spec in registry if spec.name in allowed_model_names]
+
+    if len(registry) < 2:
+        raise RuntimeError(
+            f"Need at least 2 models after registry filtering, "
+            f"got {len(registry)} for model_task={model_task}, "
+            f"models={[spec.name for spec in registry]}"
+        )
+
+    return registry
+
+
+def _select_final_model(
+    metric_df: pd.DataFrame,
+    meta_eval_type: str,
+    meta_model: str,
+    stacked_future_pred: np.ndarray,
+    future_base: pd.DataFrame,
+) -> tuple[np.ndarray, str, str, float]:
+    """
+    在 base model 與 stacking model 之間選出最終預測。
+
+    規則（對應限制條件：不能固定使用 stacking）：
+        1. stacking 只有在 meta_eval_type == "rolling_meta_oof"（honest OOF）時，
+           才有資格被拿來跟 base model 比較。
+        2. meta_eval_type == "insample_meta" 時，stacking metric 是用同一批 OOF
+           訓練後又回頭預測，屬於過度樂觀的評估，不能拿來做最終選模依據，
+           一律優先採用 base model 中 overall WAPE 最低者。
+        3. 兩者都可比較時，取 overall WAPE 較低者作為最終預測。
+
+    注意：
+        metric_df 可能同時包含多個 meta model 的 stacking 比較結果（--compare-meta-models），
+        這裡只挑 model_name == "stacking_{meta_model}" 這一列（也就是實際要拿來
+        產生 forecast_df 的「主要」meta model），不會跟其他純比較用的 meta model 搞混。
+
+    回傳：
+        (final_pred, final_model_name, final_model_layer, selected_wape)
+    """
+    overall = metric_df.loc[metric_df["metric_level"].eq("overall")].copy()
+
+    base_overall = overall.loc[
+        overall["model_layer"].eq("base")
+        & overall["WAPE"].notna()
+        & np.isfinite(overall["WAPE"])
+    ].sort_values("WAPE", ascending=True)
+
+    stack_overall = overall.loc[
+        overall["model_layer"].eq("stacking")
+        & overall["model_name"].eq(f"stacking_{meta_model}")
+    ]
+    stack_wape = np.nan
+
+    if not stack_overall.empty:
+        candidate = stack_overall["WAPE"].iloc[0]
+        if pd.notna(candidate) and np.isfinite(candidate):
+            stack_wape = float(candidate)
+
+    stacking_is_honest = meta_eval_type == "rolling_meta_oof" and pd.notna(stack_wape)
+
+    best_base_wape = (
+        float(base_overall["WAPE"].iloc[0]) if not base_overall.empty else np.nan
+    )
+    best_base_name = (
+        base_overall["model_name"].iloc[0] if not base_overall.empty else None
+    )
+
+    use_stacking = stacking_is_honest and (
+        pd.isna(best_base_wape) or stack_wape < best_base_wape
+    )
+
+    if use_stacking:
+        return (
+            stacked_future_pred,
+            f"stacking_{meta_model}",
+            "stacking",
+            stack_wape,
+        )
+
+    if best_base_name is not None and best_base_name in future_base.columns:
+        return (
+            future_base[best_base_name].to_numpy(),
+            str(best_base_name),
+            "base",
+            best_base_wape,
+        )
+
+    # 沒有可信的 base model metric，也沒有 honest stacking 可用時，
+    # 仍以 stacking 預測作為保底輸出，避免完全沒有 forecast 結果。
+    return (
+        stacked_future_pred,
+        f"stacking_{meta_model}",
+        "stacking",
+        np.nan,
+    )
+
+
 def run_source(
     data_source: str,
     forecast_period: int,
@@ -1631,7 +1935,16 @@ def run_source(
     enable_sarimax: bool = False,
     meta_model: str = "ridge",
     model_task: str = "default",
+    compare_meta_models: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    compare_meta_models：
+        除了 meta_model（用來產生正式 forecast_df 的主要 meta model）之外，
+        額外要一併比較 OOF 表現的 meta model 方法清單。
+        base model 只會訓練一次，不會因為比較多個 meta model 而重複訓練。
+        最終 forecast_df 仍然只由 meta_model 這個「主要」方法（或 best base model）產生，
+        其餘方法只會出現在 metric_df / leaderboard / breakdown 裡作比較用。
+    """
     cfg = _resolve_config(
         run_mode=run_mode,
         recent_weeks=recent_weeks,
@@ -1808,44 +2121,14 @@ def run_source(
     if len(feature_cols) == 0:
         raise RuntimeError(f"No feature columns selected for source={data_source}")
 
-    registry = build_base_registry(
+    registry = resolve_allowed_registry(
         numeric_cols=selected_numeric_cols,
         categorical_cols=categorical_cols,
-        use_gpu=use_gpu,
         model_task=model_task,
+        cfg_model_names=cfg.model_names,
+        use_gpu=use_gpu,
+        enable_sarimax=enable_sarimax,
     )
-
-    allowed_model_names = set(cfg.model_names) - {"keras_mlp"}
-
-    if model_task in {"nhi_ev_branch", "rods_ev_national"}:
-        allowed_model_names.discard("ridge")
-
-        allowed_model_names.update(
-            {
-                "xgboost_poisson",
-                "lightgbm_poisson",
-                "catboost_poisson",
-            }
-        )
-
-    if enable_sarimax:
-        allowed_model_names.add("sarimax")
-    else:
-        allowed_model_names.discard("sarimax")
-
-    registry = [
-        spec
-        for spec in registry
-        if spec.name in allowed_model_names
-    ]
-
-    if len(registry) < 2:
-        raise RuntimeError(
-            f"Need at least 2 models after registry filtering, "
-            f"got {len(registry)} for source={data_source}, "
-            f"model_task={model_task}, "
-            f"models={[spec.name for spec in registry]}"
-        )
 
     print(
         f"[MODEL_POOL] source={data_source}, "
@@ -1887,10 +2170,11 @@ def run_source(
     # 移除整欄都沒有預測的模型
     oof = oof.dropna(axis=1, how="all")
 
-    # stacking 不吃有缺值的列，避免 meta model 因 NaN 出錯
-    valid_mask = oof.notna().all(axis=1)
+    # stacking 需要完整的 base 特徵，這裡先篩出所有 base model 都有預測的列，
+    # 只用於建立 meta model 的訓練矩陣，不會拿來限制 base model 自己的評估樣本。
+    stack_valid_mask = oof.notna().all(axis=1)
 
-    if valid_mask.sum() == 0:
+    if stack_valid_mask.sum() == 0:
         raise RuntimeError(f"OOF prediction is empty for source={data_source}")
 
     if oof.shape[1] < 2:
@@ -1899,68 +2183,46 @@ def run_source(
             f"got {oof.shape[1]} for source={data_source}"
         )
 
-    oof_valid = oof.loc[valid_mask].copy()
-    y_valid = train.loc[valid_mask, "count"].copy()
-    yearweek_valid = train.loc[valid_mask, "yearweek"].copy()
+    oof_valid = oof.loc[stack_valid_mask].copy()
+    y_valid = train.loc[stack_valid_mask, "count"].copy()
+    yearweek_valid = train.loc[stack_valid_mask, "yearweek"].copy()
 
-    stacked_oof = _fit_predict_meta_oof(
+    # 主要 meta model（用來產生 forecast_df）永遠會被評估，
+    # compare_meta_models 是額外要一起比較、但不會拿去產生 forecast 的方法。
+    meta_methods_to_run = list(
+        dict.fromkeys([meta_model] + list(compare_meta_models or []))
+    )
+
+    meta_results = _evaluate_meta_models(
         oof_valid=oof_valid,
         y_valid=y_valid,
         yearweek_valid=yearweek_valid,
-        method=meta_model,
+        methods=meta_methods_to_run,
         n_splits=cfg.n_splits,
-        min_train_weeks=12,
     )
 
-    if np.isnan(stacked_oof).all():
+    primary_result = meta_results[meta_model]
+    stacked_oof = primary_result.stacked_oof
+    meta = primary_result.meta
+    meta_eval_type = primary_result.meta_eval_type
+
+    if len(meta_methods_to_run) > 1:
         print(
-            f"[WARN] honest meta OOF unavailable; "
-            f"fallback to in-sample meta metric. "
-            f"source={data_source}, model_task={model_task}, meta_model={meta_model}",
+            f"[META_COMPARE] source={data_source}, model_task={model_task}, "
+            f"methods={meta_methods_to_run}",
             flush=True,
-        )
-
-        meta_eval_type = "insample_meta"
-        meta = fit_meta_model(
-            oof_valid,
-            y_valid,
-            method=meta_model,
-        )
-        stacked_oof = predict_meta(meta, oof_valid)
-
-    else:
-        meta_eval_type = "rolling_meta_oof"
-
-        meta = fit_meta_model(
-            oof_valid,
-            y_valid,
-            method=meta_model,
         )
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    if model_task == "rods_ev_national":
-        model_scope = "national"
-    elif model_task == "nhi_ev_branch":
-        model_scope = "branch"
-    else:
-        model_scope = "county"
-
-    is_rods_ev_national = model_task == "rods_ev_national"
-
-    is_offshore_collapsed = model_task in {
-        "default",
-        "nhi_non_ev_county",
-        "rods_non_ev",
-    }
+    task_meta = resolve_task_metadata(model_task)
+    model_scope = task_meta["model_scope"]
+    is_rods_ev_national = task_meta["is_rods_ev_national"]
+    is_offshore_collapsed = task_meta["is_offshore_collapsed"]
 
     weather_removed = len(removed_weather_cols) > 0
 
-    metric_df = _build_eval_metric_df(
-        train=train,
-        oof=oof,
-        stacked_oof=stacked_oof,
-        valid_mask=valid_mask,
+    base_context = _make_base_metric_context(
         data_source=data_source,
         run_mode=run_mode,
         feature_set=cfg.feature_set,
@@ -1968,20 +2230,36 @@ def run_source(
         top_k=cfg.top_k,
         covid_policy=covid_policy,
         enable_grid_search=enable_grid_search,
-        meta_model=meta_model,
         now=now,
     )
+
+    # base model 的 metric 只算一次，不會因為比較多個 meta model 而重算。
+    rows = _build_base_metric_rows(train, oof, base_context)
+
+    # 每個 meta model（含主要與比較用的）各自產生自己的 stacking rows，
+    # 並各自標記正確的 meta_model / meta_eval_type，不會互相混淆。
+    for method, result in meta_results.items():
+        method_rows = _build_stacking_metric_rows(
+            train, stack_valid_mask, result.stacked_oof, method, base_context
+        )
+        for row in method_rows:
+            row["meta_model"] = method
+            row["meta_eval_type"] = result.meta_eval_type
+        rows.extend(method_rows)
+
+    metric_df = _finalize_metric_df(rows)
     metric_df["model_task"] = model_task
     metric_df["model_scope"] = model_scope
     metric_df["is_rods_ev_national"] = is_rods_ev_national
     metric_df["is_offshore_collapsed"] = is_offshore_collapsed
     metric_df["weather_removed"] = weather_removed
-    metric_df["meta_model"] = meta_model
-    metric_df["meta_eval_type"] = np.where(
-        metric_df["model_layer"].eq("stacking"),
-        meta_eval_type,
-        "base_oof",
-    )
+
+    # base model rows 沒有自己的 meta model，這裡統一標記成主要 meta model 作參考，
+    # 並固定 meta_eval_type=base_oof，維持既有 schema 相容性。
+    base_mask = metric_df["model_layer"].eq("base")
+    metric_df.loc[base_mask, "meta_model"] = meta_model
+    metric_df.loc[base_mask, "meta_eval_type"] = "base_oof"
+
     future_base = _fit_final_base_predictions(
         train=train,
         future=future,
@@ -1999,49 +2277,27 @@ def run_source(
         future_base = future_base.fillna(future_base.median(numeric_only=True))
         future_base = future_base.fillna(0)
 
+    # 只用主要 meta model 產生實際要輸出的 forecast，比較用的 meta model
+    # 不會拿去做未來預測，只出現在 metric_df 裡供比較。
     stacked_future_pred = predict_meta(meta, future_base)
 
-    # 注意：
-    # stacked_oof 是 meta model 在同一批 OOF base features 上訓練後再預測同一批資料，
-    # 這不是 honest meta OOF，容易讓 stacking 的評估過度樂觀。
-    # 因此 final model selection 只用 base model 的 overall WAPE。
-    # stacking 仍保留在 metric_df 裡作參考，但不作為自動選模依據。
-    overall_metric = metric_df.loc[
-        metric_df["metric_level"].eq("overall")
-        & metric_df["model_layer"].eq("base")
-    ].copy()
-
-    overall_metric = overall_metric[
-        overall_metric["WAPE"].notna()
-        & np.isfinite(overall_metric["WAPE"])
-    ].copy()
-
-    if overall_metric.empty:
-        final_pred = stacked_future_pred
-        final_model_name = f"stacking_{meta_model}"
-        final_model_layer = "stacking"
-        best_wape = np.nan
-    else:
-        overall_metric = overall_metric.sort_values("WAPE", ascending=True)
-
-        best_row = overall_metric.iloc[0]
-        best_model_name = best_row.get("model_name")
-        best_wape = best_row.get("WAPE")
-
-        if best_model_name in future_base.columns:
-            final_pred = future_base[best_model_name].to_numpy()
-            final_model_name = str(best_model_name)
-            final_model_layer = "base"
-        else:
-            final_pred = stacked_future_pred
-            final_model_name = f"stacking_{meta_model}"
-            final_model_layer = "stacking"
+    # 最終選模：只有在 meta_eval_type == "rolling_meta_oof"（honest OOF）時，
+    # stacking 才有資格跟 base model 比較 overall WAPE；
+    # 若 stacking 仍是 insample_meta（過度樂觀的評估），一律優先採用 base model。
+    final_pred, final_model_name, final_model_layer, best_wape = _select_final_model(
+        metric_df=metric_df,
+        meta_eval_type=meta_eval_type,
+        meta_model=meta_model,
+        stacked_future_pred=stacked_future_pred,
+        future_base=future_base,
+    )
 
     print(
         f"[FINAL_MODEL] source={data_source}, "
         f"model_task={model_task}, "
         f"final_model={final_model_layer}/{final_model_name}, "
-        f"best_base_oof_wape={best_wape}",
+        f"meta_eval_type={meta_eval_type}, "
+        f"selected_wape={best_wape}",
         flush=True,
     )
 
@@ -2222,6 +2478,7 @@ def run_all(
     use_gpu: bool = False,
     enable_sarimax: bool = False,
     meta_model: str = "ridge",
+    compare_meta_models: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     forecasts = []
     bases = []
@@ -2246,6 +2503,7 @@ def run_all(
             use_gpu=use_gpu,
             enable_sarimax=enable_sarimax,
             meta_model=meta_model,
+            compare_meta_models=compare_meta_models,
             covid_policy=covid_policy,
             enable_grid_search=enable_grid_search,
             grid_cv_splits=grid_cv_splits,

@@ -136,10 +136,17 @@ def load_dim_features() -> pd.DataFrame:
     df = df[df["yearweek"].notna()].copy()
     df["yearweek"] = df["yearweek"].astype(int)
 
+    # voc 判斷寒暑假週：yearweek 取後兩碼即為該年第幾週。
+    # 修正說明：舊版用 int(x) - round(int(x), -2) 取週數，
+    # 當週數為 50~52 時 round(..., -2) 會進位到下一個百位數，
+    # 導致計算結果變成負數而永遠無法命中 voc 週次清單，是一個計算錯誤而非資料粒度邏輯，故在此修正。
+    # 直接對 100 取餘數即可正確且穩定地取出週數，不受進位影響。
     df = df.assign(
         ev_period=df["date"].apply(lambda x: 1 if x.month in [3, 4, 5, 6, 9] else 0),
         di_period=df["NAME"].apply(lambda x: 1 if x in ["農曆除夕", "春節", "中秋節", "國慶日"] else 0),
-        voc=df["yearweek"].apply(lambda x: 1 if (int(x) - round(int(x), -2)) in [5, 6, 7, 28, 29, 30, 31, 32, 33, 34, 35, 36] else 0),
+        voc=(df["yearweek"].astype(int) % 100).isin(
+            [5, 6, 7, 28, 29, 30, 31, 32, 33, 34, 35, 36]
+        ).astype(int),
         leave=df["LEAVE"].apply(lambda x: 1 if x == "是" else 0),
         eve=df["LY"].apply(lambda x: 1 if x in ["小年夜", "除夕", "初一", "初二", "初三", "初四", "初五"] else 0),
     )

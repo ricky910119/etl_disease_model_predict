@@ -164,6 +164,27 @@ def parse_args():
             "nonnegative_linear",
         ],
         default="ridge",
+        help="正式產生 forecast 用的主要 meta model。",
+    )
+
+    parser.add_argument(
+        "--compare-meta-models",
+        nargs="+",
+        choices=[
+            "ridge",
+            "elasticnet",
+            "lasso",
+            "huber",
+            "nonnegative_linear",
+        ],
+        default=None,
+        help=(
+            "額外比較的 meta model 清單（不含 --meta-model 也沒關係，會自動併入比較）。"
+            "base model 只會訓練一次，不會因為比較多個 meta model 而重複訓練，"
+            "比較結果會出現在 leaderboard.csv / breakdown.csv，"
+            "並額外輸出 meta_model_comparison.csv 方便直接比較。"
+            "最終 forecast.csv 仍然只由 --meta-model 指定的方法（或 best base model）產生。"
+        ),
     )
 
     parser.add_argument(
@@ -201,26 +222,55 @@ def _is_valid_text(value) -> bool:
     return text not in {"", "nan", "None", "NaN", "<NA>"}
 
 
-def _make_model_method(row: pd.Series) -> str:
-    model_task = row.get("model_task")
-    model_layer = row.get("model_layer")
-    model_name = row.get("model_name")
-    base_model = row.get("base_model")
+_INVALID_TEXT_TOKENS = {"", "nan", "None", "NaN", "<NA>"}
 
-    name = model_name if _is_valid_text(model_name) else base_model
 
-    if not _is_valid_text(name):
-        name = "unknown"
+def _clean_text_col(df: pd.DataFrame, col: str) -> pd.Series:
+    """把欄位轉成字串並將無效值統一標記為 NA，供向量化字串組合使用。"""
+    if col not in df.columns:
+        return pd.Series(pd.NA, index=df.index, dtype="string")
 
-    if _is_valid_text(model_task) and str(model_task) != "default":
-        if _is_valid_text(model_layer):
-            return f"{model_task}/{model_layer}/{name}"
-        return f"{model_task}/{name}"
+    s = df[col].astype("string")
+    return s.where(s.notna() & ~s.isin(_INVALID_TEXT_TOKENS))
 
-    if _is_valid_text(model_layer):
-        return f"{model_layer}/{name}"
 
-    return str(name)
+def _model_method_series(df: pd.DataFrame) -> pd.Series:
+    """
+    向量化版本的 model_method 組合邏輯。
+
+    語意與逐列版本完全一致：
+        model_task != default 且有 model_layer -> "{task}/{layer}/{name}"
+        model_task != default 且無 model_layer -> "{task}/{name}"
+        model_task == default 且有 model_layer -> "{layer}/{name}"
+        其餘                                   -> "{name}"
+
+    用向量化字串操作取代 df.apply(axis=1)，在列數較多時可大幅縮短輸出組裝時間。
+    """
+    model_task = _clean_text_col(df, "model_task")
+    model_layer = _clean_text_col(df, "model_layer")
+    model_name = _clean_text_col(df, "model_name")
+    base_model = _clean_text_col(df, "base_model")
+
+    name = model_name.fillna(base_model).fillna("unknown")
+
+    has_task = model_task.notna() & (model_task != "default")
+    has_layer = model_layer.notna()
+
+    result = pd.Series(pd.NA, index=df.index, dtype="string")
+
+    mask = has_task & has_layer
+    result.loc[mask] = model_task[mask] + "/" + model_layer[mask] + "/" + name[mask]
+
+    mask = has_task & ~has_layer
+    result.loc[mask] = model_task[mask] + "/" + name[mask]
+
+    mask = ~has_task & has_layer
+    result.loc[mask] = model_layer[mask] + "/" + name[mask]
+
+    mask = ~has_task & ~has_layer
+    result.loc[mask] = name[mask]
+
+    return result.astype(str)
 
 
 def _compact_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -228,13 +278,13 @@ def _compact_metric_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=METRIC_OUTPUT_COLS)
 
     out = df.copy()
-    out["model_method"] = out.apply(_make_model_method, axis=1)
+    out["model_method"] = _model_method_series(out)
 
     for col in ["disease", "county"]:
         if col not in out.columns:
-            out[col] = ""
+            out[col] = "ALL"
 
-        out[col] = out[col].fillna("")
+        out[col] = out[col].fillna("ALL")
 
     keep_cols = [c for c in METRIC_OUTPUT_COLS if c in out.columns]
 
@@ -246,7 +296,7 @@ def _compact_prediction_columns(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame(columns=PREDICTION_OUTPUT_COLS)
 
     out = df.copy()
-    out["model_method"] = out.apply(_make_model_method, axis=1)
+    out["model_method"] = _model_method_series(out)
 
     for col in ["disease", "county"]:
         if col not in out.columns:
@@ -314,6 +364,71 @@ def _make_breakdown(metric_df: pd.DataFrame, top_n: int = 200) -> pd.DataFrame:
     return _compact_metric_columns(breakdown).head(top_n)
 
 
+def _make_meta_model_comparison(metric_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    整理每個 data_source/model_task 底下，各個 meta model 的 stacking overall WAPE，
+    並附上該任務 best base model 的 WAPE 作為比較基準（wape_vs_best_base < 0 代表
+    這個 meta model 的 stacking 比目前最好的 base model 還準）。
+
+    單一 meta model 執行時這張表只會有一列；搭配 --compare-meta-models 時，
+    同一個 data_source/model_task 會出現多列，方便直接比較。
+    """
+    if metric_df.empty or "metric_level" not in metric_df.columns:
+        return pd.DataFrame()
+
+    overall = metric_df.loc[metric_df["metric_level"].eq("overall")].copy()
+
+    if overall.empty:
+        return pd.DataFrame()
+
+    group_cols = [
+        c for c in ["data_source", "model_task", "model_scope"]
+        if c in overall.columns
+    ]
+
+    if not group_cols:
+        return pd.DataFrame()
+
+    base_rows = overall.loc[
+        overall["model_layer"].eq("base") & overall["WAPE"].notna()
+    ].copy()
+
+    if base_rows.empty:
+        base_best = pd.DataFrame(columns=group_cols + ["best_base_model", "best_base_wape"])
+    else:
+        base_best = (
+            base_rows.sort_values("WAPE")
+            .groupby(group_cols, dropna=False, as_index=False)
+            .first()[group_cols + ["model_name", "WAPE"]]
+            .rename(columns={"model_name": "best_base_model", "WAPE": "best_base_wape"})
+        )
+
+    stacking_rows = overall.loc[overall["model_layer"].eq("stacking")].copy()
+
+    if stacking_rows.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        c for c in [
+            "data_source", "model_task", "model_scope",
+            "meta_model", "meta_eval_type", "model_name",
+            "n_obs", "WAPE", "MAE", "RMSE", "Bias",
+        ]
+        if c in stacking_rows.columns
+    ]
+
+    comparison = stacking_rows[keep_cols].merge(base_best, on=group_cols, how="left")
+    comparison["wape_vs_best_base"] = comparison["WAPE"] - comparison["best_base_wape"]
+    comparison["stacking_wins"] = comparison["wape_vs_best_base"] < 0
+
+    sort_cols = [c for c in group_cols + ["WAPE"] if c in comparison.columns]
+
+    if sort_cols:
+        comparison = comparison.sort_values(sort_cols)
+
+    return comparison.reset_index(drop=True)
+
+
 def _make_run_summary(
     args,
     metric_df: pd.DataFrame,
@@ -346,6 +461,11 @@ def _make_run_summary(
                 "enable_grid_search": args.enable_grid_search,
                 "grid_cv_splits": args.grid_cv_splits,
                 "meta_model": args.meta_model,
+                "compare_meta_models": (
+                    ",".join(args.compare_meta_models)
+                    if getattr(args, "compare_meta_models", None)
+                    else None
+                ),
                 "use_gpu": args.use_gpu,
                 "enable_sarimax": args.enable_sarimax,
                 "metric_rows": len(metric_df),
@@ -364,12 +484,13 @@ def _write_outputs(
     metric_df: pd.DataFrame,
     args,
     output_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     leaderboard_df = _make_leaderboard(metric_df)
     breakdown_df = _make_breakdown(metric_df)
     predictions_df = _compact_prediction_columns(forecast_df)
     base_predictions_df = _compact_prediction_columns(base_df)
     summary_df = _make_run_summary(args, metric_df, leaderboard_df)
+    meta_comparison_df = _make_meta_model_comparison(metric_df)
 
     leaderboard_df.to_csv(
         output_dir / "leaderboard.csv",
@@ -401,12 +522,19 @@ def _write_outputs(
         encoding="utf-8-sig",
     )
 
+    meta_comparison_df.to_csv(
+        output_dir / "meta_model_comparison.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
     return (
         leaderboard_df,
         breakdown_df,
         predictions_df,
         base_predictions_df,
         summary_df,
+        meta_comparison_df,
     )
 
 
@@ -416,6 +544,7 @@ def _print_console_summary(
     predictions_df: pd.DataFrame,
     base_predictions_df: pd.DataFrame,
     summary_df: pd.DataFrame,
+    meta_comparison_df: pd.DataFrame,
     output_dir: Path,
 ) -> None:
     print("\n========== MODEL SUMMARY ==========")
@@ -427,6 +556,8 @@ def _print_console_summary(
         print(f"sources           : {row.get('sources')}")
         print(f"covid_policy      : {row.get('covid_policy')}")
         print(f"enable_grid_search: {row.get('enable_grid_search')}")
+        print(f"meta_model        : {row.get('meta_model')}")
+        print(f"compare_meta_models: {row.get('compare_meta_models')}")
         print(f"best_model        : {row.get('best_model_by_wape')}")
         print(f"best_wape         : {row.get('best_wape')}")
         print(f"output_dir        : {output_dir}")
@@ -479,12 +610,32 @@ def _print_console_summary(
         show_cols = [c for c in show_cols if c in breakdown_df.columns]
         print(breakdown_df[show_cols].head(10).to_string(index=False))
 
+    print("\n========== META MODEL COMPARISON ==========")
+
+    if meta_comparison_df.empty:
+        print("[WARN] meta model comparison is empty")
+    else:
+        show_cols = [
+            "data_source",
+            "model_task",
+            "meta_model",
+            "meta_eval_type",
+            "WAPE",
+            "best_base_model",
+            "best_base_wape",
+            "wape_vs_best_base",
+            "stacking_wins",
+        ]
+        show_cols = [c for c in show_cols if c in meta_comparison_df.columns]
+        print(meta_comparison_df[show_cols].to_string(index=False))
+
     print("\nwritten files:")
     print(f"  {output_dir / 'leaderboard.csv'}")
     print(f"  {output_dir / 'breakdown.csv'}")
     print(f"  {output_dir / 'predictions.csv'}")
     print(f"  {output_dir / 'base_predictions.csv'}")
     print(f"  {output_dir / 'run_summary.csv'}")
+    print(f"  {output_dir / 'meta_model_comparison.csv'}")
 
     if (output_dir / "plots").exists():
         print(f"  {output_dir / 'plots'}/*.png")
@@ -496,10 +647,15 @@ def _resolve_output_dir(args) -> Path:
     if args.output_dir:
         return Path(args.output_dir)
 
-    if args.task == "holdout":
-        return Path(f"outputs/holdout_{args.holdout_weeks}w")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    return Path("outputs/forecast")
+    if args.task == "holdout":
+        return Path(
+            f"outputs/holdout_{args.holdout_weeks}w"
+            f"_{args.run_mode}_meta_{args.meta_model}_{timestamp}"
+        )
+
+    return Path(f"outputs/forecast_{args.run_mode}_meta_{args.meta_model}_{timestamp}")
 
 
 def main():
@@ -523,6 +679,7 @@ def main():
             grid_cv_splits=args.grid_cv_splits,
             use_gpu=args.use_gpu,
             enable_sarimax=args.enable_sarimax,
+            compare_meta_models=args.compare_meta_models,
             meta_model=args.meta_model,
         )
 
@@ -559,6 +716,7 @@ def main():
         predictions_df,
         base_predictions_df,
         summary_df,
+        meta_comparison_df,
     ) = _write_outputs(
         forecast_df=forecast_df,
         base_df=base_df,
@@ -576,6 +734,7 @@ def main():
         predictions_df=predictions_df,
         base_predictions_df=base_predictions_df,
         summary_df=summary_df,
+        meta_comparison_df=meta_comparison_df,
         output_dir=output_dir,
     )
 

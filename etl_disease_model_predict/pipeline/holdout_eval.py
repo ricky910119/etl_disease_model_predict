@@ -16,7 +16,6 @@ from etl_disease_model_predict.features.dataset import (
     build_feature_table,
     get_exog_columns,
 )
-from etl_disease_model_predict.modeling.base_models import build_base_registry
 from etl_disease_model_predict.modeling.stacking import fit_meta_model, predict_meta
 from etl_disease_model_predict.pipeline.train_predict import (
     KEY_COLS,
@@ -33,6 +32,8 @@ from etl_disease_model_predict.pipeline.train_predict import (
     _fit_predict_local_oof,
     _fit_final_base_predictions,
     _metric_row,
+    resolve_task_metadata,
+    resolve_allowed_registry,
 )
 
 
@@ -164,18 +165,6 @@ def setup_chinese_font() -> None:
     plt.rcParams["mathtext.rm"] = "Times New Roman"
     plt.rcParams["mathtext.it"] = "Times New Roman:italic"
     plt.rcParams["mathtext.bf"] = "Times New Roman:bold"
-
-
-def _task_metadata(model_task: str, removed_weather_cols: list[str]) -> dict:
-    model_scope = "national" if model_task == "rods_ev_national" else "county"
-
-    return {
-        "model_task": model_task,
-        "model_scope": model_scope,
-        "is_rods_ev_national": model_task == "rods_ev_national",
-        "is_offshore_collapsed": model_task in {"default", "rods_non_ev"},
-        "weather_removed": len(removed_weather_cols) > 0,
-    }
 
 
 def _get_holdout_weeks(
@@ -465,7 +454,11 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
         model_task=model_task,
     )
 
-    meta_info = _task_metadata(model_task, removed_weather_cols)
+    meta_info = {
+        "model_task": model_task,
+        **resolve_task_metadata(model_task),
+        "weather_removed": len(removed_weather_cols) > 0,
+    }
 
     feature = _apply_covid_policy(
         df=feature,
@@ -536,12 +529,20 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
 
     feature_cols = categorical_cols + selected_numeric_cols
 
-    registry = build_base_registry(
+    registry = resolve_allowed_registry(
         numeric_cols=selected_numeric_cols,
         categorical_cols=categorical_cols,
+        model_task=model_task,
+        cfg_model_names=cfg.model_names,
         use_gpu=args.use_gpu,
-        model_names=cfg.model_names + (["sarimax"] if args.enable_sarimax else []),
         enable_sarimax=args.enable_sarimax,
+    )
+
+    print(
+        f"[MODEL_POOL] source={data_source}, "
+        f"model_task={model_task}, "
+        f"models={[spec.name for spec in registry]}",
+        flush=True,
     )
 
     global_oof = _fit_predict_global_oof(
@@ -651,6 +652,10 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
 
     context_base = {
         **meta_info,
+        "disease": "ALL",
+        "county": "ALL",
+        "meta_model": args.meta_model,
+        "meta_eval_type": "holdout_backtest",
         "run_mode": args.run_mode,
         "feature_set": cfg.feature_set,
         "feature_select": cfg.feature_select,

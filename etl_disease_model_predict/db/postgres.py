@@ -94,13 +94,16 @@ def _to_qmark_sql(
 def _records_as_tuples(df: pd.DataFrame) -> list[tuple[Any, ...]]:
     """
     將 DataFrame 轉成 pyodbc executemany 可用的 tuple records。
+
+    使用 itertuples(name=None) 取代 iterrows，
+    在欄位數與資料列數較多時可明顯縮短轉換時間。
     """
-    records: list[tuple[Any, ...]] = []
+    columns = list(df.columns)
 
-    for _, row in df.iterrows():
-        records.append(tuple(_python_value(row[col]) for col in df.columns))
-
-    return records
+    return [
+        tuple(_python_value(v) for v in row)
+        for row in df[columns].itertuples(index=False, name=None)
+    ]
 
 
 @conn.deco.postgres(dbname="postgres")

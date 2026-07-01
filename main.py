@@ -10,7 +10,7 @@ from etl_disease_model_predict.config import settings
 from etl_disease_model_predict.db.postgres import append_dataframe
 from etl_disease_model_predict.pipeline.train_predict import run_all
 from etl_disease_model_predict.pipeline.holdout_eval import run_holdout_all
-
+from etl_disease_model_predict.modeling.combiner import ALL_META_METHODS
 
 RUN_MODE_CHOICES = ["smoke", "fast", "full", "forecast"]
 FEATURE_SET_CHOICES = ["base", "medium", "full"]
@@ -156,13 +156,7 @@ def parse_args():
 
     parser.add_argument(
         "--meta-model",
-        choices=[
-            "ridge",
-            "elasticnet",
-            "lasso",
-            "huber",
-            "nonnegative_linear",
-        ],
+        choices=sorted(ALL_META_METHODS),
         default="ridge",
         help="正式產生 forecast 用的主要 meta model。",
     )
@@ -170,13 +164,7 @@ def parse_args():
     parser.add_argument(
         "--compare-meta-models",
         nargs="+",
-        choices=[
-            "ridge",
-            "elasticnet",
-            "lasso",
-            "huber",
-            "nonnegative_linear",
-        ],
+        choices=sorted(ALL_META_METHODS),
         default=None,
         help=(
             "額外比較的 meta model 清單（不含 --meta-model 也沒關係，會自動併入比較）。"

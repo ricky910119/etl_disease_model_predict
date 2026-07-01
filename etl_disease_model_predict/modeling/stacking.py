@@ -16,6 +16,12 @@ from sklearn.linear_model import (
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+# stacking.py 只負責「迴歸型」meta model：
+# 用 sklearn estimator 從 base model 的 OOF 預測值學出組合權重。
+# 規則型 ensemble（simple_average / weighted_average / topk_average）
+# 定義在 modeling/ensemble.py，兩者互不依賴，統一由 modeling/combiner.py 路由。
+REGRESSION_METHODS = {"ridge", "elasticnet", "lasso", "huber", "nonnegative_linear"}
+
 
 @dataclass
 class MetaModel:
@@ -49,8 +55,6 @@ def _clean_meta_y(y) -> pd.Series:
 
 
 def _make_meta_estimator(method: str) -> BaseEstimator:
-    method = str(method).lower().strip()
-
     if method == "ridge":
         return make_pipeline(
             StandardScaler(),
@@ -96,8 +100,8 @@ def _make_meta_estimator(method: str) -> BaseEstimator:
         )
 
     raise ValueError(
-        f"Unknown meta model method={method}. "
-        f"Allowed: ridge, elasticnet, lasso, huber, nonnegative_linear"
+        f"Unknown regression meta model method={method}. "
+        f"Allowed: {sorted(REGRESSION_METHODS)}"
     )
 
 
@@ -106,6 +110,9 @@ def fit_meta_model(
     y,
     method: str = "ridge",
 ) -> MetaModel:
+    """用 sklearn estimator 訓練一個迴歸型 meta model。"""
+    method = str(method).lower().strip()
+
     x_df = _clean_meta_x(x)
     y_sr = _clean_meta_y(y)
 

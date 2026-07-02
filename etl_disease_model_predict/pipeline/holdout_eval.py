@@ -35,7 +35,13 @@ from etl_disease_model_predict.pipeline.train_predict import (
     resolve_task_metadata,
     resolve_allowed_registry,
 )
-
+from etl_disease_model_predict.modeling.combiner import (
+    fit_combiner,
+    predict_combiner,
+    combiner_layer,
+    combiner_model_name,
+    ALL_META_METHODS,
+)
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -308,8 +314,8 @@ def _build_holdout_metric_df(
     stack_tmp = holdout_pred.copy()
     context = context_base.copy()
     context["data_source"] = data_source
-    context["model_layer"] = "stacking"
-    context["model_name"] = f"stacking_{meta_model}"
+    context["model_layer"] = combiner_layer(meta_model)
+    context["model_name"] = combiner_model_name(meta_model)
     context["prediction_type"] = "holdout"
 
     c = context.copy()
@@ -618,7 +624,7 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
     holdout_pred["top_k"] = cfg.top_k
     holdout_pred["covid_policy"] = args.covid_policy
     holdout_pred["enable_grid_search"] = args.enable_grid_search
-    holdout_pred["model_name"] = f"stacking_{args.meta_model}"
+    holdout_pred["model_name"] = combiner_model_name(args.meta_model)
     holdout_pred["created_at"] = now
 
     base_rows = []

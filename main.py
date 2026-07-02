@@ -391,21 +391,23 @@ def _make_meta_model_comparison(metric_df: pd.DataFrame) -> pd.DataFrame:
             .rename(columns={"model_name": "best_base_model", "WAPE": "best_base_wape"})
         )
 
-    stacking_rows = overall.loc[overall["model_layer"].eq("stacking")].copy()
+    combiner_rows = overall.loc[
+        overall["model_layer"].isin(["stacking", "ensemble"])
+    ].copy()
 
-    if stacking_rows.empty:
+    if combiner_rows.empty:
         return pd.DataFrame()
 
     keep_cols = [
         c for c in [
             "data_source", "model_task", "model_scope",
-            "meta_model", "meta_eval_type", "model_name",
+            "model_layer", "meta_model", "meta_eval_type", "model_name",
             "n_obs", "WAPE", "MAE", "RMSE", "Bias",
         ]
-        if c in stacking_rows.columns
+        if c in combiner_rows.columns
     ]
 
-    comparison = stacking_rows[keep_cols].merge(base_best, on=group_cols, how="left")
+    comparison = combiner_rows[keep_cols].merge(base_best, on=group_cols, how="left")
     comparison["wape_vs_best_base"] = comparison["WAPE"] - comparison["best_base_wape"]
     comparison["stacking_wins"] = comparison["wape_vs_best_base"] < 0
 

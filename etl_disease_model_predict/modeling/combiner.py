@@ -29,7 +29,33 @@ ALL_META_METHODS = REGRESSION_METHODS | RULE_BASED_METHODS
 
 CombinerModel = MetaModel | EnsembleModel
 
+def combiner_layer(method: str) -> str:
+    """
+    回傳這個組合方法在輸出（metric_df / forecast_df / base_df）裡該標記的 model_layer。
 
+    REGRESSION_METHODS（ridge/elasticnet/lasso/huber/nonnegative_linear）-> "stacking"
+    RULE_BASED_METHODS（simple_average/weighted_average/topk_average）  -> "ensemble"
+
+    這是唯一決定這個標籤的地方，避免規則型 ensemble 在報表裡被誤標成 stacking。
+    """
+    method = str(method).lower().strip()
+
+    if method in RULE_BASED_METHODS:
+        return "ensemble"
+
+    if method in REGRESSION_METHODS:
+        return "stacking"
+
+    raise ValueError(
+        f"Unknown combiner method={method}. Allowed: {sorted(ALL_META_METHODS)}"
+    )
+
+
+def combiner_model_name(method: str) -> str:
+    """回傳這個組合方法在輸出裡該用的 model_name，例如 stacking_ridge 或 ensemble_simple_average。"""
+    method = str(method).lower().strip()
+    return f"{combiner_layer(method)}_{method}"
+    
 def fit_combiner(
     x,
     y,

@@ -29,6 +29,12 @@ from etl_disease_model_predict.modeling.stacking import (
     fit_meta_model,
     predict_meta,
 )
+from etl_disease_model_predict.modeling.combiner import (
+    fit_combiner,
+    predict_combiner,
+    combiner_layer,
+    combiner_model_name,
+)
 from etl_disease_model_predict.utils.week import (
     forecast_yearweeks,
     latest_closed_yearweek,
@@ -1303,7 +1309,7 @@ def _build_base_metric_rows(
     return rows
 
 
-def _build_stacking_metric_rows(
+def _build_combiner_metric_rows(
     train: pd.DataFrame,
     stack_valid_mask: pd.Series,
     stacked_oof: np.ndarray,
@@ -1323,8 +1329,8 @@ def _build_stacking_metric_rows(
     stack_df["y_pred"] = stacked_oof
 
     stack_context = base_context.copy()
-    stack_context["model_layer"] = "stacking"
-    stack_context["model_name"] = f"stacking_{meta_model}"
+    stack_context["model_layer"] = combiner_layer(meta_model)
+    stack_context["model_name"] = combiner_model_name(meta_model)
 
     context = stack_context.copy()
     context["metric_level"] = "overall"
@@ -1388,7 +1394,7 @@ def _build_eval_metric_df(
     """
     建立單一 meta model 情境下的完整 metric_df（base + 這個 meta model 的 stacking）。
 
-    內部呼叫 _build_base_metric_rows() 與 _build_stacking_metric_rows()，
+    內部呼叫 _build_base_metric_rows() 與 _build_combiner_metric_rows()，
     只是把兩者組起來，維持舊有單一 meta model 呼叫方式的相容性。
     比較多個 meta model 時請改用這兩個拆開的函式，避免 base rows 重算。
     """
@@ -1404,7 +1410,7 @@ def _build_eval_metric_df(
     )
 
     rows = _build_base_metric_rows(train, oof, base_context)
-    rows += _build_stacking_metric_rows(
+    rows += _build_combiner_metric_rows(
         train, stack_valid_mask, stacked_oof, meta_model, base_context
     )
 
@@ -1568,13 +1574,13 @@ def _fit_predict_meta_oof(
             continue
 
         try:
-            meta_fold = fit_meta_model(
+            meta_fold = fit_combiner(
                 x.loc[tr_idx],
                 work.loc[tr_idx, "count"],
                 method=method,
             )
 
-            fold_pred = predict_meta(
+            fold_pred = predict_combiner(
                 meta_fold,
                 x.loc[va_idx],
             )
@@ -1635,11 +1641,11 @@ def _evaluate_meta_models(
                 flush=True,
             )
             meta_eval_type = "insample_meta"
-            meta = fit_meta_model(oof_valid, y_valid, method=method)
-            stacked_oof = predict_meta(meta, oof_valid)
+            meta = fit_combiner(oof_valid, y_valid, method=method)
+            stacked_oof = predict_combiner(meta, oof_valid)
         else:
             meta_eval_type = "rolling_meta_oof"
-            meta = fit_meta_model(oof_valid, y_valid, method=method)
+            meta = fit_combiner(oof_valid, y_valid, method=method)
 
         results[method] = MetaModelResult(
             method=method,
@@ -1869,14 +1875,17 @@ def _select_final_model(
         & np.isfinite(overall["WAPE"])
     ].sort_values("WAPE", ascending=True)
 
-    stack_overall = overall.loc[
-        overall["model_layer"].eq("stacking")
-        & overall["model_name"].eq(f"stacking_{meta_model}")
+    primary_layer = combiner_layer(meta_model)
+    primary_name = combiner_model_name(meta_model)
+
+    combiner_overall = overall.loc[
+        overall["model_layer"].eq(primary_layer)
+        & overall["model_name"].eq(primary_name)
     ]
     stack_wape = np.nan
 
-    if not stack_overall.empty:
-        candidate = stack_overall["WAPE"].iloc[0]
+    if not combiner_overall.empty:
+        candidate = combiner_overall["WAPE"].iloc[0]
         if pd.notna(candidate) and np.isfinite(candidate):
             stack_wape = float(candidate)
 
@@ -1896,9 +1905,10 @@ def _select_final_model(
     if use_stacking:
         return (
             stacked_future_pred,
-            f"stacking_{meta_model}",
-            "stacking",
+            primary_name,
+            primary_layer,
             stack_wape,
+
         )
 
     if best_base_name is not None and best_base_name in future_base.columns:
@@ -1913,8 +1923,8 @@ def _select_final_model(
     # 仍以 stacking 預測作為保底輸出，避免完全沒有 forecast 結果。
     return (
         stacked_future_pred,
-        f"stacking_{meta_model}",
-        "stacking",
+        primary_name,
+        primary_layer,
         np.nan,
     )
 
@@ -2239,7 +2249,7 @@ def run_source(
     # 每個 meta model（含主要與比較用的）各自產生自己的 stacking rows，
     # 並各自標記正確的 meta_model / meta_eval_type，不會互相混淆。
     for method, result in meta_results.items():
-        method_rows = _build_stacking_metric_rows(
+        method_rows = _build_combiner_metric_rows(
             train, stack_valid_mask, result.stacked_oof, method, base_context
         )
         for row in method_rows:
@@ -2279,7 +2289,7 @@ def run_source(
 
     # 只用主要 meta model 產生實際要輸出的 forecast，比較用的 meta model
     # 不會拿去做未來預測，只出現在 metric_df 裡供比較。
-    stacked_future_pred = predict_meta(meta, future_base)
+    stacked_future_pred = predict_combiner(meta, future_base)
 
     # 最終選模：只有在 meta_eval_type == "rolling_meta_oof"（honest OOF）時，
     # stacking 才有資格跟 base model 比較 overall WAPE；

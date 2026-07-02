@@ -22,18 +22,22 @@ TASK_CHOICES = ["forecast", "holdout"]
 METRIC_OUTPUT_COLS = [
     "data_source",
     "model_method",
+    "metric_level",
     "MAE",
     "RMSE",
     "MAPE",
     "sMAPE",
     "WAPE",
     "Bias",
+    "Pearson",
+    "HitRate",
     "y_true_sum",
     "y_pred_sum",
     "y_true_mean",
     "y_pred_mean",
     "disease",
     "county",
+    "lead_week",
 ]
 
 
@@ -43,6 +47,7 @@ PREDICTION_OUTPUT_COLS = [
     "disease",
     "county",
     "yearweek",
+    "lead_week",
     "actual_count",
     "forecast_count",
     "forecast_count_rounded",
@@ -339,7 +344,7 @@ def _make_breakdown(metric_df: pd.DataFrame, top_n: int = 200) -> pd.DataFrame:
 
     breakdown = metric_df.loc[
         metric_df["metric_level"].isin(
-            ["by_disease", "by_county", "by_disease_county"]
+            ["by_disease", "by_county", "by_disease_county", "by_lead_week"]
         )
     ].copy()
 
@@ -418,6 +423,53 @@ def _make_meta_model_comparison(metric_df: pd.DataFrame) -> pd.DataFrame:
 
     return comparison.reset_index(drop=True)
 
+def _make_lead_week_summary(metric_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    整理 by_lead_week 這個聚合層級的結果，方便直接看準確度是否隨預測距離拉遠而下降。
+
+    只有 holdout 任務會產生這個層級（forecast 任務的未來週還沒有實際值可算 metric）。
+    每個 data_source/model_task/model_name 各自列出每個 lead_week 的 WAPE，
+    依 data_source/model_task/model_name/lead_week 排序，方便直接看出趨勢。
+    """
+    if metric_df.empty or "metric_level" not in metric_df.columns:
+        return pd.DataFrame()
+
+    lw = metric_df.loc[metric_df["metric_level"].eq("by_lead_week")].copy()
+
+    if lw.empty:
+        return pd.DataFrame()
+
+    keep_cols = [
+        c for c in [
+            "data_source",
+            "model_task",
+            "model_scope",
+            "model_layer",
+            "model_name",
+            "meta_model",
+            "lead_week",
+            "n_obs",
+            "WAPE",
+            "MAE",
+            "RMSE",
+            "Pearson",
+            "HitRate",
+            "Bias",
+        ]
+        if c in lw.columns
+    ]
+
+    sort_cols = [
+        c for c in ["data_source", "model_task", "model_name", "lead_week"]
+        if c in lw.columns
+    ]
+
+    out = lw[keep_cols].copy()
+
+    if sort_cols:
+        out = out.sort_values(sort_cols)
+
+    return out.reset_index(drop=True)
 
 def _make_run_summary(
     args,
@@ -474,13 +526,14 @@ def _write_outputs(
     metric_df: pd.DataFrame,
     args,
     output_dir: Path,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     leaderboard_df = _make_leaderboard(metric_df)
     breakdown_df = _make_breakdown(metric_df)
     predictions_df = _compact_prediction_columns(forecast_df)
     base_predictions_df = _compact_prediction_columns(base_df)
     summary_df = _make_run_summary(args, metric_df, leaderboard_df)
     meta_comparison_df = _make_meta_model_comparison(metric_df)
+    lead_week_summary_df = _make_lead_week_summary(metric_df)
 
     leaderboard_df.to_csv(
         output_dir / "leaderboard.csv",
@@ -517,6 +570,11 @@ def _write_outputs(
         index=False,
         encoding="utf-8-sig",
     )
+    lead_week_summary_df.to_csv(
+        output_dir / "lead_week_summary.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     return (
         leaderboard_df,
@@ -525,6 +583,7 @@ def _write_outputs(
         base_predictions_df,
         summary_df,
         meta_comparison_df,
+        lead_week_summary_df,
     )
 
 
@@ -535,6 +594,7 @@ def _print_console_summary(
     base_predictions_df: pd.DataFrame,
     summary_df: pd.DataFrame,
     meta_comparison_df: pd.DataFrame,
+    lead_week_summary_df: pd.DataFrame,
     output_dir: Path,
 ) -> None:
     print("\n========== MODEL SUMMARY ==========")
@@ -566,6 +626,8 @@ def _print_console_summary(
             "sMAPE",
             "WAPE",
             "Bias",
+            "Pearson",
+            "HitRate",
             "y_true_sum",
             "y_pred_sum",
             "y_true_mean",
@@ -584,18 +646,22 @@ def _print_console_summary(
         show_cols = [
             "data_source",
             "model_method",
+            "metric_level",
             "MAE",
             "RMSE",
             "MAPE",
             "sMAPE",
             "WAPE",
             "Bias",
+            "Pearson",
+            "HitRate",
             "y_true_sum",
             "y_pred_sum",
             "y_true_mean",
             "y_pred_mean",
             "disease",
             "county",
+            "lead_week",
         ]
         show_cols = [c for c in show_cols if c in breakdown_df.columns]
         print(breakdown_df[show_cols].head(10).to_string(index=False))
@@ -619,6 +685,24 @@ def _print_console_summary(
         show_cols = [c for c in show_cols if c in meta_comparison_df.columns]
         print(meta_comparison_df[show_cols].to_string(index=False))
 
+    print("\n========== LEAD WEEK TREND (holdout only) ==========")
+
+    if lead_week_summary_df.empty:
+        print("[INFO] no by_lead_week rows (只有 --task holdout 才會有這張表)")
+    else:
+        show_cols = [
+            "data_source",
+            "model_task",
+            "model_name",
+            "lead_week",
+            "n_obs",
+            "WAPE",
+            "Pearson",
+            "HitRate",
+        ]
+        show_cols = [c for c in show_cols if c in lead_week_summary_df.columns]
+        print(lead_week_summary_df[show_cols].to_string(index=False))
+
     print("\nwritten files:")
     print(f"  {output_dir / 'leaderboard.csv'}")
     print(f"  {output_dir / 'breakdown.csv'}")
@@ -626,6 +710,7 @@ def _print_console_summary(
     print(f"  {output_dir / 'base_predictions.csv'}")
     print(f"  {output_dir / 'run_summary.csv'}")
     print(f"  {output_dir / 'meta_model_comparison.csv'}")
+    print(f"  {output_dir / 'lead_week_summary.csv'}")
 
     if (output_dir / "plots").exists():
         print(f"  {output_dir / 'plots'}/*.png")
@@ -707,6 +792,7 @@ def main():
         base_predictions_df,
         summary_df,
         meta_comparison_df,
+        lead_week_summary_df,
     ) = _write_outputs(
         forecast_df=forecast_df,
         base_df=base_df,
@@ -725,6 +811,7 @@ def main():
         base_predictions_df=base_predictions_df,
         summary_df=summary_df,
         meta_comparison_df=meta_comparison_df,
+        lead_week_summary_df=lead_week_summary_df,
         output_dir=output_dir,
     )
 

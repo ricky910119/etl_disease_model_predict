@@ -1125,16 +1125,53 @@ def _fit_model_with_optional_grid_search(
 
         raise
 
+def _add_directional_hit(
+    df: pd.DataFrame,
+    key_cols: list[str],
+    time_col: str = "yearweek",
+    y_true_col: str = "y_true",
+    y_pred_col: str = "y_pred",
+) -> pd.DataFrame:
+    """
+    計算逐期漲跌方向是否命中，用於算 HitRate。
+
+    在每個 key（例如 data_source/disease/county）內依時間排序後，
+    比較「這一期 - 上一期」的實際值漲跌方向，跟預測值的漲跌方向是否一致。
+    兩者都持平（差值為 0）也視為方向一致；每個 key 的第一筆資料沒有「上一期」
+    可比較，標記為 NaN，不會計入 HitRate 平均。
+
+    這裡是唯一計算 _hit 欄位的地方，之後不管聚合層級怎麼切（overall／
+    by_disease／by_county／by_lead_week...），只要對這欄位取平均，
+    就能得到該聚合範圍內正確的方向命中率，不會被跨 key 的錯誤比較污染。
+    """
+    out = df.sort_values(key_cols + [time_col]).copy()
+    grp = out.groupby(key_cols, dropna=False)
+
+    true_diff = grp[y_true_col].diff()
+    pred_diff = grp[y_pred_col].diff()
+
+    hit = np.sign(true_diff) == np.sign(pred_diff)
+    hit = hit.where(true_diff.notna() & pred_diff.notna())
+
+    out["_hit"] = hit.astype(float)
+
+    return out
+
 def _metric_row(
     y_true,
     y_pred,
     context: dict,
+    hit: pd.Series | None = None,
 ) -> dict:
     """
     建立單一 metric row。
 
-    這裡直接計算 MAE / RMSE / MAPE / sMAPE / WAPE / Bias，
+    這裡直接計算 MAE / RMSE / MAPE / sMAPE / WAPE / Bias / Pearson / HitRate，
     不依賴 regression_metrics()，避免欄位名稱不一致造成 output 缺欄位。
+
+    Pearson：預測值與實際值的相關係數，補足 WAPE 無法反映的「趨勢形狀」。
+    HitRate：逐期漲跌方向的命中率，需搭配 _add_directional_hit() 產生的 hit
+        欄位使用；沒有提供 hit 時回傳 NaN，不影響其他欄位計算。
     """
     yt = pd.to_numeric(pd.Series(y_true), errors="coerce")
     yp = pd.to_numeric(pd.Series(y_pred), errors="coerce")
@@ -1161,6 +1198,8 @@ def _metric_row(
                 "sMAPE": np.nan,
                 "WAPE": np.nan,
                 "Bias": np.nan,
+                "Pearson": np.nan,
+                "HitRate": np.nan,
                 "y_true_sum": np.nan,
                 "y_pred_sum": np.nan,
                 "y_true_mean": np.nan,
@@ -1205,6 +1244,23 @@ def _metric_row(
         wape = np.nan
         bias = np.nan
 
+    # Pearson correlation：兩邊都要有變化（標準差 > 0）才有意義，
+    # 其中一邊是常數序列時相關係數無定義，回傳 NaN 而不是讓 numpy 噴警告。
+    if len(yt) >= 2 and yt.std(ddof=0) > 0 and yp.std(ddof=0) > 0:
+        pearson = float(np.corrcoef(yt, yp)[0, 1])
+    else:
+        pearson = np.nan
+
+    # HitRate：需搭配 _add_directional_hit() 產生的 hit 欄位，用同一個 mask
+    # 對齊，確保只計入實際有計算出方向命中的列（排除每個 key 的第一筆）。
+    if hit is not None:
+        hit_aligned = pd.to_numeric(pd.Series(hit), errors="coerce").loc[mask]
+        hit_rate = (
+            float(hit_aligned.mean()) if hit_aligned.notna().any() else np.nan
+        )
+    else:
+        hit_rate = np.nan
+
     row.update(
         {
             "MAE": mae,
@@ -1213,6 +1269,8 @@ def _metric_row(
             "sMAPE": smape,
             "WAPE": wape,
             "Bias": bias,
+            "Pearson": pearson,
+            "HitRate": hit_rate,
             "y_true_sum": y_true_sum,
             "y_pred_sum": y_pred_sum,
             "y_true_mean": float(yt.mean()),
@@ -1272,6 +1330,7 @@ def _build_base_metric_rows(
 
         tmp = train.loc[model_mask, id_cols].rename(columns={"count": "y_true"}).copy()
         tmp["y_pred"] = oof.loc[model_mask, model_name].values
+        tmp = _add_directional_hit(tmp, key_cols=KEY_COLS)
 
         if tmp.empty:
             continue
@@ -1282,19 +1341,19 @@ def _build_base_metric_rows(
 
         context = model_context.copy()
         context["metric_level"] = "overall"
-        rows.append(_metric_row(tmp["y_true"], tmp["y_pred"], context))
+        rows.append(_metric_row(tmp["y_true"], tmp["y_pred"], context, hit=tmp["_hit"]))
 
         for disease, g in tmp.groupby("disease", dropna=False):
             context = model_context.copy()
             context["metric_level"] = "by_disease"
             context["disease"] = disease
-            rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+            rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
         for county, g in tmp.groupby("county", dropna=False):
             context = model_context.copy()
             context["metric_level"] = "by_county"
             context["county"] = county
-            rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+            rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
         for (disease, county), g in tmp.groupby(
             ["disease", "county"],
@@ -1304,7 +1363,7 @@ def _build_base_metric_rows(
             context["metric_level"] = "by_disease_county"
             context["disease"] = disease
             context["county"] = county
-            rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+            rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
     return rows
 
@@ -1327,6 +1386,7 @@ def _build_combiner_metric_rows(
 
     stack_df = train.loc[stack_valid_mask, id_cols].rename(columns={"count": "y_true"}).copy()
     stack_df["y_pred"] = stacked_oof
+    stack_df = _add_directional_hit(stack_df, key_cols=KEY_COLS)
 
     stack_context = base_context.copy()
     stack_context["model_layer"] = combiner_layer(meta_model)
@@ -1334,19 +1394,19 @@ def _build_combiner_metric_rows(
 
     context = stack_context.copy()
     context["metric_level"] = "overall"
-    rows.append(_metric_row(stack_df["y_true"], stack_df["y_pred"], context))
+    rows.append(_metric_row(stack_df["y_true"], stack_df["y_pred"], context, hit=stack_df["_hit"]))
 
     for disease, g in stack_df.groupby("disease", dropna=False):
         context = stack_context.copy()
         context["metric_level"] = "by_disease"
         context["disease"] = disease
-        rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+        rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
     for county, g in stack_df.groupby("county", dropna=False):
         context = stack_context.copy()
         context["metric_level"] = "by_county"
         context["county"] = county
-        rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+        rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
     for (disease, county), g in stack_df.groupby(
         ["disease", "county"],
@@ -1356,7 +1416,7 @@ def _build_combiner_metric_rows(
         context["metric_level"] = "by_disease_county"
         context["disease"] = disease
         context["county"] = county
-        rows.append(_metric_row(g["y_true"], g["y_pred"], context))
+        rows.append(_metric_row(g["y_true"], g["y_pred"], context, hit=g["_hit"]))
 
     return rows
 
@@ -2313,8 +2373,16 @@ def run_source(
 
     id_cols = KEY_COLS + ["yearweek"]
 
+    future_lead_week = (
+        future.groupby(KEY_COLS)["yearweek"]
+        .rank(method="first")
+        .astype(int)
+    )
+
     forecast_df = future[id_cols].copy()
+    forecast_df["lead_week"] = future_lead_week.to_numpy()
     forecast_df["forecast_count"] = final_pred
+
     forecast_df["forecast_count_rounded"] = (
         np.clip(np.rint(forecast_df["forecast_count"].fillna(0)), 0, None)
         .astype(int)
@@ -2338,6 +2406,7 @@ def run_source(
 
     for model_name in future_base.columns:
         tmp = future[id_cols].copy()
+        tmp["lead_week"] = future_lead_week.to_numpy()
         tmp["base_model"] = model_name
         tmp["model_task"] = model_task
         tmp["model_scope"] = model_scope

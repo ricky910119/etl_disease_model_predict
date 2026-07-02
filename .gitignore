@@ -9,3 +9,4 @@ outputs/*.csv
 catboost_info/
 outputs/
 logs/
+assets/

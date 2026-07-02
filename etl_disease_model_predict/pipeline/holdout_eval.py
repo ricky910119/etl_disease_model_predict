@@ -16,7 +16,7 @@ from etl_disease_model_predict.features.dataset import (
     build_feature_table,
     get_exog_columns,
 )
-from etl_disease_model_predict.modeling.stacking import fit_meta_model, predict_meta
+
 from etl_disease_model_predict.pipeline.train_predict import (
     KEY_COLS,
     _resolve_config,
@@ -32,6 +32,7 @@ from etl_disease_model_predict.pipeline.train_predict import (
     _fit_predict_local_oof,
     _fit_final_base_predictions,
     _metric_row,
+    _add_directional_hit,
     resolve_task_metadata,
     resolve_allowed_registry,
 )
@@ -42,7 +43,7 @@ from etl_disease_model_predict.modeling.combiner import (
     combiner_model_name,
     ALL_META_METHODS,
 )
-
+FONT_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Run last-N-weeks holdout validation and plot recent trend."
@@ -129,7 +130,7 @@ def parse_args():
 
     parser.add_argument(
         "--meta-model",
-        choices=["ridge", "elasticnet"],
+        choices=sorted(ALL_META_METHODS),
         default="ridge",
     )
 
@@ -153,24 +154,74 @@ def parse_args():
 
 
 def setup_chinese_font() -> None:
-    # 設定字型以符合學術發表標準 (英數字: Times New Roman, 中文: 標楷體)
-    plt.rcParams["font.family"] = "sans-serif"
-    plt.rcParams["font.sans-serif"] = [
-        "Times New Roman", 
-        "TW-Kai", 
-        "BiauKai", 
-        "DFKai-SB", 
-        "AR PL UKai TW", # Linux 標楷體
-        "Noto Sans CJK TC", 
-        "Microsoft JhengHei"
+    """
+    設定圖表字型，讓中文（縣市名、標題等）能正確顯示。
+
+    分兩層，第一層不依賴伺服器上「剛好有沒有裝」某個字型：
+        1. 掃描專案內建字型目錄 assets/fonts/ 底下的 .ttf/.otf/.ttc，
+           用 font_manager.addfont() 直接註冊給 matplotlib，
+           不需要 sudo、不需要系統字型安裝，換到哪台 server 都一樣可用。
+        2. 系統原本就有安裝的中文字型（依名稱比對）作為備援，
+           萬一 assets/fonts/ 是空的，至少還有機會用到系統字型。
+
+    若兩層都找不到任何支援中文的字型，會印出清楚的 [WARN]，
+    避免中文顯示成缺字方框卻完全沒有任何提示。
+    """
+    bundled_families: list[str] = []
+
+    if FONT_DIR.exists():
+        for font_path in sorted(FONT_DIR.glob("*")):
+            if font_path.suffix.lower() not in {".ttf", ".otf", ".ttc"}:
+                continue
+
+            try:
+                font_manager.fontManager.addfont(str(font_path))
+                family = font_manager.FontProperties(fname=str(font_path)).get_name()
+                bundled_families.append(family)
+            except Exception as exc:
+                print(
+                    f"[WARN] 無法載入字型檔 {font_path}: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
+    fallback_system_families = [
+        "Noto Sans CJK TC",
+        "Noto Sans TC",
+        "AR PL UKai TW",
+        "AR PL UMing TW",
+        "TW-Kai",
+        "BiauKai",
+        "DFKai-SB",
+        "Microsoft JhengHei",
+        "PingFang TC",
     ]
+
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = (
+        bundled_families + fallback_system_families + ["Times New Roman"]
+    )
     plt.rcParams["axes.unicode_minus"] = False
-    
-    # 確保座標軸刻度與標籤的英數字也強制使用設定的字型
+
     plt.rcParams["mathtext.fontset"] = "custom"
     plt.rcParams["mathtext.rm"] = "Times New Roman"
     plt.rcParams["mathtext.it"] = "Times New Roman:italic"
     plt.rcParams["mathtext.bf"] = "Times New Roman:bold"
+
+    available = {f.name for f in font_manager.fontManager.ttflist}
+    resolved = [f for f in plt.rcParams["font.sans-serif"] if f in available]
+
+    if not bundled_families and not any(
+        f in available for f in fallback_system_families
+    ):
+        print(
+            f"[WARN] 找不到任何中文字型（{FONT_DIR} 是空的，系統上也沒有裝對應名稱的字型），"
+            "圖表中的中文（縣市名等）會顯示成缺字方框。"
+            f"請把 .ttf/.otf/.ttc 字型檔放進 {FONT_DIR} 底下再重新執行。",
+            flush=True,
+        )
+    else:
+        print(f"[FONT] 實際套用字型優先順序: {resolved}", flush=True)
 
 
 def _get_holdout_weeks(
@@ -270,9 +321,21 @@ def _build_holdout_metric_df(
     meta_model: str,
     context_base: dict,
 ) -> pd.DataFrame:
+    """
+    建立 holdout 的 metric_df。
+
+    除了原本的 overall／by_disease／by_county／by_disease_county 四種聚合層級，
+    這裡額外加上 by_lead_week：holdout 是從同一個預測起點往後遞迴展開多週，
+    lead_week 代表「這是預測起點之後的第幾週」，可以直接看出準確度是否隨著
+    預測距離拉遠而下降（呼應論文裡 nowcast 到 3-week forecast 誤差遞增的分析）。
+
+    每個 metric row 也會同時算出 Pearson correlation 與 HitRate（逐期漲跌方向
+    命中率），HitRate 需要先用 _add_directional_hit() 在最細粒度算好方向命中欄位，
+    這裡才能不管怎麼分組聚合都得到正確結果。
+    """
     rows = []
 
-    eval_cols = KEY_COLS + ["yearweek", "actual_count"]
+    eval_cols = KEY_COLS + ["yearweek", "lead_week", "actual_count"]
 
     for model_name in base_pred.columns:
         tmp = holdout_pred[eval_cols].copy()
@@ -282,6 +345,13 @@ def _build_holdout_metric_df(
         if tmp.empty:
             continue
 
+        tmp = _add_directional_hit(
+            tmp,
+            key_cols=KEY_COLS,
+            y_true_col="actual_count",
+            y_pred_col="y_pred",
+        )
+
         context = context_base.copy()
         context["data_source"] = data_source
         context["model_layer"] = "base"
@@ -290,28 +360,41 @@ def _build_holdout_metric_df(
 
         c = context.copy()
         c["metric_level"] = "overall"
-        rows.append(_metric_row(tmp["actual_count"], tmp["y_pred"], c))
+        rows.append(_metric_row(tmp["actual_count"], tmp["y_pred"], c, hit=tmp["_hit"]))
 
         for disease, g in tmp.groupby("disease", dropna=False):
             c = context.copy()
             c["metric_level"] = "by_disease"
             c["disease"] = disease
-            rows.append(_metric_row(g["actual_count"], g["y_pred"], c))
+            rows.append(_metric_row(g["actual_count"], g["y_pred"], c, hit=g["_hit"]))
 
         for county, g in tmp.groupby("county", dropna=False):
             c = context.copy()
             c["metric_level"] = "by_county"
             c["county"] = county
-            rows.append(_metric_row(g["actual_count"], g["y_pred"], c))
+            rows.append(_metric_row(g["actual_count"], g["y_pred"], c, hit=g["_hit"]))
 
         for (disease, county), g in tmp.groupby(["disease", "county"], dropna=False):
             c = context.copy()
             c["metric_level"] = "by_disease_county"
             c["disease"] = disease
             c["county"] = county
-            rows.append(_metric_row(g["actual_count"], g["y_pred"], c))
+            rows.append(_metric_row(g["actual_count"], g["y_pred"], c, hit=g["_hit"]))
+
+        for lead_week, g in tmp.groupby("lead_week", dropna=False):
+            c = context.copy()
+            c["metric_level"] = "by_lead_week"
+            c["lead_week"] = lead_week
+            rows.append(_metric_row(g["actual_count"], g["y_pred"], c, hit=g["_hit"]))
 
     stack_tmp = holdout_pred.copy()
+    stack_tmp = _add_directional_hit(
+        stack_tmp,
+        key_cols=KEY_COLS,
+        y_true_col="actual_count",
+        y_pred_col="forecast_count",
+    )
+
     context = context_base.copy()
     context["data_source"] = data_source
     context["model_layer"] = combiner_layer(meta_model)
@@ -320,26 +403,34 @@ def _build_holdout_metric_df(
 
     c = context.copy()
     c["metric_level"] = "overall"
-    rows.append(_metric_row(stack_tmp["actual_count"], stack_tmp["forecast_count"], c))
+    rows.append(
+        _metric_row(stack_tmp["actual_count"], stack_tmp["forecast_count"], c, hit=stack_tmp["_hit"])
+    )
 
     for disease, g in stack_tmp.groupby("disease", dropna=False):
         c = context.copy()
         c["metric_level"] = "by_disease"
         c["disease"] = disease
-        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c))
+        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c, hit=g["_hit"]))
 
     for county, g in stack_tmp.groupby("county", dropna=False):
         c = context.copy()
         c["metric_level"] = "by_county"
         c["county"] = county
-        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c))
+        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c, hit=g["_hit"]))
 
     for (disease, county), g in stack_tmp.groupby(["disease", "county"], dropna=False):
         c = context.copy()
         c["metric_level"] = "by_disease_county"
         c["disease"] = disease
         c["county"] = county
-        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c))
+        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c, hit=g["_hit"]))
+
+    for lead_week, g in stack_tmp.groupby("lead_week", dropna=False):
+        c = context.copy()
+        c["metric_level"] = "by_lead_week"
+        c["lead_week"] = lead_week
+        rows.append(_metric_row(g["actual_count"], g["forecast_count"], c, hit=g["_hit"]))
 
     return pd.DataFrame(rows)
 
@@ -489,7 +580,9 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
     )
 
     holdout_start_week = int(holdout_weeks[0])
-
+    # lead_week：holdout 期間內每個 yearweek 對應第幾個 horizon（1 = 第一週）。
+    # holdout_weeks 已經是依時間排序的清單，直接用位置對應即可。
+    week_to_lead = {int(w): i + 1 for i, w in enumerate(holdout_weeks)}
     base_train = hist[
         ~hist["yearweek"].astype(int).isin(holdout_weeks)
     ].copy()
@@ -583,7 +676,7 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
             f"Need at least 2 base models for stacking, got {oof.shape[1]}"
         )
 
-    meta = fit_meta_model(
+    meta = fit_combiner(
         oof.loc[valid_mask],
         train.loc[valid_mask, "count"],
         method=args.meta_model,
@@ -606,9 +699,10 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
         holdout_base = holdout_base.fillna(holdout_base.median(numeric_only=True))
         holdout_base = holdout_base.fillna(0)
 
-    final_pred = predict_meta(meta, holdout_base)
+    final_pred = predict_combiner(meta, holdout_base)
 
     holdout_pred = holdout_feature[KEY_COLS + ["yearweek", "actual_count"]].copy()
+    holdout_pred["lead_week"] = holdout_pred["yearweek"].astype(int).map(week_to_lead)
     holdout_pred["forecast_count"] = final_pred
     holdout_pred["forecast_count_rounded"] = (
         np.clip(np.rint(holdout_pred["forecast_count"]), 0, None)
@@ -631,6 +725,7 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
 
     for model_name in holdout_base.columns:
         tmp = holdout_feature[KEY_COLS + ["yearweek", "actual_count"]].copy()
+        tmp["lead_week"] = tmp["yearweek"].astype(int).map(week_to_lead)
         tmp["base_model"] = model_name
         tmp["forecast_count"] = holdout_base[model_name].values
         tmp["forecast_count_rounded"] = (
@@ -660,6 +755,7 @@ def run_task(args, task: dict, output_dir: Path) -> tuple[pd.DataFrame, pd.DataF
         **meta_info,
         "disease": "ALL",
         "county": "ALL",
+        "lead_week": np.nan,
         "meta_model": args.meta_model,
         "meta_eval_type": "holdout_backtest",
         "run_mode": args.run_mode,
